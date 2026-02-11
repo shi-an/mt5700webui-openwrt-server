@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{Timelike, Utc};
+use chrono::{NaiveTime, Timelike, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -756,6 +756,135 @@ impl ATConnection for TomModemATConn {
     }
 }
 
+// UbusAtDaemonConnection 实现
+struct UbusAtDaemonConn {
+    port: String,
+    timeout: u64,
+    is_connected: bool,
+    response: Option<String>,
+}
+
+#[async_trait]
+impl ATConnection for UbusAtDaemonConn {
+    async fn connect(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.is_connected = true;
+        Ok(())
+    }
+
+    async fn send(&mut self, data: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        if !self.is_connected {
+            return Err("Disconnected".into());
+        }
+
+        let command = String::from_utf8_lossy(data).trim().to_string();
+        
+        // 构造 JSON 参数
+        let params = serde_json::json!({
+            "at_port": self.port,
+            "at_cmd": command,
+            "timeout": self.timeout
+        });
+
+        // 执行 ubus 命令
+        // ubus call at-daemon sendat '{"at_port":"...","at_cmd":"..."}'
+        let output = timeout(
+            Duration::from_secs(self.timeout + 2), // 给 ubus 多一点时间
+            tokio::process::Command::new("ubus")
+                .arg("call")
+                .arg("at-daemon")
+                .arg("sendat")
+                .arg(params.to_string())
+                .output(),
+        )
+        .await??;
+
+        if output.status.success() {
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            
+            // 解析返回的 JSON
+            // 期望格式: {"jsonrpc": "2.0", "id": 1, "result": [0, { "response": "..." }]}
+            // 但 ubus call 直接返回 result 数组的内容或者对象，这取决于具体的 ubus 实现细节。
+            // 通常 ubus call output 是 JSON 对象或数组。
+            // 根据 web_reference:
+            // {
+            //   "jsonrpc": "2.0",
+            //   "id": 1,
+            //   "result": [
+            //     0,
+            //     {
+            //       "response": "\r\nMH5000-82M\r\n\r\nOK\r\n",
+            //       ...
+            //     }
+            //   ]
+            // }
+            // 这是通过 HTTP rpcd 调用的返回。直接 ubus call 的返回通常是 result 部分的内容。
+            // 假设 ubus call at-daemon sendat 返回的是:
+            // {
+            //    "port": "...",
+            //    "response": "...",
+            //    "status": "success"
+            // }
+            // 或者
+            // { "result": [0, {...}] }
+            // 实际上 OpenWrt 的 ubus call 输出通常是 JSON 格式的 payload。
+            
+            // 尝试解析为 Value
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
+                // 尝试获取 response 字段
+                // OpenWrt ubus call 直接返回 result 内容，通常是一个对象
+                // 成功示例: { "port": "...", "command": "...", "status": "success", "response": "..." }
+                // 失败示例: 可能没有 response 字段
+                
+                let response_str = if let Some(resp) = v.get("response") {
+                    resp.as_str().unwrap_or("").to_string()
+                } else {
+                     // 检查是否是数组格式（虽然通常是对象）
+                     if let Some(arr) = v.as_array() {
+                         if arr.len() > 1 {
+                             // 如果是 [0, {response: ...}] 格式
+                             arr[1].get("response").and_then(|r| r.as_str()).unwrap_or("").to_string()
+                         } else {
+                             // 可能是空数组或其他
+                             "".to_string()
+                         }
+                     } else {
+                        // 可能是没有 response 字段的 JSON 对象
+                        // 检查是否有错误信息
+                        if let Some(err) = v.get("error") {
+                             format!("ERROR: {}", err)
+                        } else {
+                             // 无法解析出 response，返回空字符串或原始 JSON
+                             format!("ERROR: No 'response' field in ubus output: {}", stdout_str)
+                        }
+                     }
+                };
+
+                self.response = Some(response_str);
+                Ok(data.len())
+            } else {
+                Err(format!("ubus output parse error: {}", stdout_str).into())
+            }
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr);
+            Err(format!("ubus执行失败: {}", error).into())
+        }
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        if let Some(response) = &self.response {
+            let data = response.clone().into_bytes();
+            self.response = None;
+            Ok(data)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.is_connected
+    }
+}
+
 struct ATClient {
     conn: Arc<Mutex<Box<dyn ATConnection>>>,
     urc_tx: broadcast::Sender<String>,
@@ -777,6 +906,13 @@ impl ATClient {
                     port: at_config.serial.port.clone(),
                     timeout: at_config.serial.timeout,
                     feature: at_config.serial.feature.clone(),
+                    is_connected: false,
+                    response: None,
+                })
+            } else if at_config.serial.method == "QMODEM" {
+                 Box::new(UbusAtDaemonConn {
+                    port: at_config.serial.port.clone(),
+                    timeout: at_config.serial.timeout,
                     is_connected: false,
                     response: None,
                 })
@@ -872,16 +1008,38 @@ struct AutoAirPlaneMode {
     client: Arc<ATClient>,
     enabled: bool,
     action_time: String,
+    action_hour: u32,
+    action_minute: u32,
 }
 
 impl AutoAirPlaneMode {
     fn new(client: Arc<ATClient>, config: Arc<Config>) -> Self {
         let auto_airplane = &config.auto_airplane;
+        
+        // 预解析时间
+        let (hour, minute) = if auto_airplane.enabled {
+            let parts: Vec<&str> = auto_airplane.action_time.split(':').collect();
+            if parts.len() == 2 {
+                let h = parts[0].parse().unwrap_or(8);
+                let m = parts[1].parse().unwrap_or(0);
+                if h < 24 && m < 60 {
+                    (h, m)
+                } else {
+                    (8, 0)
+                }
+            } else {
+                (8, 0)
+            }
+        } else {
+            (0, 0)
+        };
 
         let mode = Self {
             client,
             enabled: auto_airplane.enabled,
             action_time: auto_airplane.action_time.clone(),
+            action_hour: hour,
+            action_minute: minute,
         };
 
         if mode.enabled {
@@ -894,28 +1052,8 @@ impl AutoAirPlaneMode {
         mode
     }
 
-    fn parse_action_time(&self) -> Result<(u32, u32), Box<dyn Error + Send + Sync>> {
-        let parts: Vec<&str> = self.action_time.split(':').collect();
-        if parts.len() != 2 {
-            return Err("无效的时间格式，需为 HH:MM".into());
-        }
-
-        let hour: u32 = parts[0].parse().map_err(|_| "无效的小时值")?;
-        let minute: u32 = parts[1].parse().map_err(|_| "无效的分钟值")?;
-
-        if hour >= 24 || minute >= 60 {
-            return Err("小时必须在0-23之间，分钟必须在0-59之间".into());
-        }
-
-        Ok((hour, minute))
-    }
-
     fn is_action_time(&self, now: &chrono::DateTime<chrono_tz::Tz>) -> bool {
-        
-        if let Ok((action_hour, action_minute)) = self.parse_action_time() {
-            return now.hour() == action_hour && now.minute() == action_minute;
-        }
-        false
+        now.hour() == self.action_hour && now.minute() == self.action_minute
     }
 
     fn current_time_string(&self) -> String {
@@ -928,7 +1066,7 @@ impl AutoAirPlaneMode {
         tokio::spawn(async move {
             println!(
                 "[{}] 自动重启飞行模式开始...",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                Utc::now().with_timezone(&Shanghai).format("%Y-%m-%d %H:%M:%S")
             );
 
             // 关闭飞行模式
@@ -948,7 +1086,7 @@ impl AutoAirPlaneMode {
 
             println!(
                 "[{}] 自动重启飞行模式完成",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                Utc::now().with_timezone(&Shanghai).format("%Y-%m-%d %H:%M:%S")
             );
         });
     }
