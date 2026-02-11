@@ -1,5 +1,5 @@
 # mt5700webui-server
-该版本为使用RUST编写的版本，并适配了Qmodem (也许)
+该版本为使用RUST编写的版本，并适配了Qmodem AT Daemon
 
 
 # 以下是原版

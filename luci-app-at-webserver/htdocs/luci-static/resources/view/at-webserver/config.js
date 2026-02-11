@@ -190,6 +190,7 @@ return view.extend({
 		o = s.option(form.ListValue, 'serial_method', _('连接方法'),
 			_('选择连接方法'));
 		o.value('TOM_MODEM', _('TOM_MODEM'));
+		o.value('QMODEM', _('QMODEM (兼容模式)'));
 		o.value('DIRECT', _('直接连接'));
 		o.default = 'TOM_MODEM';
 		o.depends('connection_type', 'SERIAL');
