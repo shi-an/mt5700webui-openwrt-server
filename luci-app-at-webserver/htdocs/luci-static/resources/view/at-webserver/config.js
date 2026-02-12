@@ -189,10 +189,9 @@ return view.extend({
 		// 串口连接方法
 		o = s.option(form.ListValue, 'serial_method', _('连接方法'),
 			_('选择连接方法'));
-		o.value('TOM_MODEM', _('TOM_MODEM'));
-		o.value('QMODEM', _('QMODEM (兼容模式)'));
+		o.value('UBUS', _('UBUS (QModem AT Daemon)'));
 		o.value('DIRECT', _('直接连接'));
-		o.default = 'TOM_MODEM';
+		o.default = 'UBUS';
 		o.depends('connection_type', 'SERIAL');
 
 		o = s.option(form.ListValue, 'serial_feature', _('UBUS特性'),
@@ -200,7 +199,7 @@ return view.extend({
 		o.value('UBUS', _('UBUS'));
 		o.value('NONE', _('无'));
 		o.default = 'UBUS';
-		o.depends('serial_method', 'TOM_MODEM');
+		o.depends('serial_method', 'UBUS');
 
 		// WebSocket配置
 		o = s.option(form.DummyValue, '_websocket_title', _('WebSocket 配置'));
@@ -477,4 +476,3 @@ return view.extend({
 
 	handleReset: null
 });
-

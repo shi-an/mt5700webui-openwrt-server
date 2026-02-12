@@ -38,8 +38,8 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
             "PORT": "COM6", 
             "BAUDRATE": 115200, 
             "TIMEOUT": 30,
-            "METHOD": "TOM_MODEM",
-            "FEATURE": "UBUS"
+            "METHOD": "UBUS",
+            "FEATURE": "NONE"
         }
     },
     "WEBSOCKET_CONFIG": {
@@ -350,11 +350,11 @@ fn load_config_from_uci() -> Result<Config, Box<dyn Error>> {
         let method = uci_data
             .get("serial_method")
             .map(|s| s.as_str())
-            .unwrap_or("TOM_MODEM");
+            .unwrap_or("UBUS");
         let feature = uci_data
             .get("serial_feature")
             .map(|s| s.as_str())
-            .unwrap_or("UBUS");
+            .unwrap_or("NONE");
 
         config.at_config.serial.method = method.to_string();
         config.at_config.serial.feature = feature.to_string();
@@ -692,69 +692,6 @@ impl ATConnection for NetworkATConn {
     }
 }
 
-// TomModemATConnection 实现
-struct TomModemATConn {
-    port: String,
-    timeout: u64,
-    feature: String,
-    is_connected: bool,
-    response: Option<String>,
-}
-
-#[async_trait]
-impl ATConnection for TomModemATConn {
-    async fn connect(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.is_connected = true;
-        Ok(())
-    }
-
-    async fn send(&mut self, data: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
-        if !self.is_connected {
-            return Err("Disconnected".into());
-        }
-
-        let command = String::from_utf8_lossy(data).trim().to_string();
-
-        // 构建tom_modem命令参数
-        let mut args = vec![self.port.clone(), "-c".to_string(), command.clone()];
-
-        if !self.feature.is_empty() && self.feature != "NONE" {
-            args.push(format!("-{}", self.feature));
-        }
-
-        // 执行命令
-        let output = timeout(
-            Duration::from_secs(self.timeout),
-            tokio::process::Command::new("tom_modem")
-                .args(&args)
-                .output(),
-        )
-        .await??;
-
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout).to_string();
-            self.response = Some(response);
-            Ok(data.len())
-        } else {
-            let error = String::from_utf8_lossy(&output.stderr);
-            Err(format!("tom_modem执行失败: {}", error).into())
-        }
-    }
-
-    async fn receive(&mut self) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-        if let Some(response) = &self.response {
-            let data = response.clone().into_bytes();
-            self.response = None;
-            Ok(data)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    fn is_connected(&self) -> bool {
-        self.is_connected
-    }
-}
 
 // UbusAtDaemonConnection 实现
 struct UbusAtDaemonConn {
@@ -901,16 +838,15 @@ impl ATClient {
                 stream: None,
             })
         } else {
-            if at_config.serial.method == "TOM_MODEM" {
-                Box::new(TomModemATConn {
+            if at_config.serial.method == "TOM_MODEM" || at_config.serial.method == "UBUS" {
+                Box::new(UbusAtDaemonConn {
                     port: at_config.serial.port.clone(),
                     timeout: at_config.serial.timeout,
-                    feature: at_config.serial.feature.clone(),
                     is_connected: false,
                     response: None,
                 })
             } else if at_config.serial.method == "QMODEM" {
-                 Box::new(UbusAtDaemonConn {
+                Box::new(UbusAtDaemonConn {
                     port: at_config.serial.port.clone(),
                     timeout: at_config.serial.timeout,
                     is_connected: false,
