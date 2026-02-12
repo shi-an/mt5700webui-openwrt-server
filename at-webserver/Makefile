@@ -48,9 +48,9 @@ FILTERED_CFLAGS:=$(filter-out --target=%,$(CFLAGS))
 FILTERED_TARGET_CFLAGS:=$(filter-out --target=%,$(TARGET_CFLAGS))
 
 CARGO_ENV:=CARGO_TARGET_DIR=$(PKG_BUILD_DIR)/target \
-           CC=$(TARGET_CC) \
-           CXX=$(TARGET_CXX) \
-           AR=$(TARGET_AR) \
+           CC="$(TARGET_CC)" \
+           CXX="$(TARGET_CXX)" \
+           AR="$(TARGET_AR)" \
            RUSTFLAGS="-C linker=$(TARGET_CC)" \
            PKG_CONFIG_ALLOW_CROSS=1 \
            CFLAGS="$(FILTERED_CFLAGS)" \
