@@ -40,15 +40,21 @@ endif
 CARGO_ARGS:=--target=$(RUST_TARGET)
 
 # Fix recursive variable and unrecognized option errors
-export CFLAGS:=$(filter-out --target=%,$(CFLAGS))
-export TARGET_CFLAGS:=$(filter-out --target=%,$(TARGET_CFLAGS))
+# We need to filter out flags that are not supported by the host compiler/gcc
+# and ensure we don't recursively reference the variables.
+# Using a temporary variable to hold the filtered value first.
+
+FILTERED_CFLAGS:=$(filter-out --target=%,$(CFLAGS))
+FILTERED_TARGET_CFLAGS:=$(filter-out --target=%,$(TARGET_CFLAGS))
 
 CARGO_ENV:=CARGO_TARGET_DIR=$(PKG_BUILD_DIR)/target \
            CC=$(TARGET_CC) \
            CXX=$(TARGET_CXX) \
            AR=$(TARGET_AR) \
            RUSTFLAGS="-C linker=$(TARGET_CC)" \
-           PKG_CONFIG_ALLOW_CROSS=1
+           PKG_CONFIG_ALLOW_CROSS=1 \
+           CFLAGS="$(FILTERED_CFLAGS)" \
+           TARGET_CFLAGS="$(FILTERED_TARGET_CFLAGS)"
 
 # Helper for cc-rs to find the correct linker
 export CC_$(subst -,_,$(RUST_TARGET)):=$(TARGET_CC)
