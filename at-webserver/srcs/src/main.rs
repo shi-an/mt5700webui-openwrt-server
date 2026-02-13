@@ -347,10 +347,20 @@ fn load_config_from_uci() -> Result<Config, Box<dyn Error>> {
         config.at_config.serial.timeout = timeout;
 
         // 读取串口方法和功能
-        let method = uci_data
-            .get("serial_method")
-            .map(|s| s.as_str())
-            .unwrap_or("UBUS");
+        // 优先读取 use_ubus (新配置)，如果不存在则回退到 serial_method (旧配置)
+        let method = if let Some(use_ubus) = uci_data.get("use_ubus") {
+            if use_ubus == "1" {
+                "UBUS"
+            } else {
+                "DIRECT"
+            }
+        } else {
+            uci_data
+                .get("serial_method")
+                .map(|s| s.as_str())
+                .unwrap_or("UBUS")
+        };
+        
         let feature = uci_data
             .get("serial_feature")
             .map(|s| s.as_str())
@@ -724,8 +734,15 @@ impl ATConnection for UbusAtDaemonConn {
 
         // 执行 ubus 命令
         // ubus call at-daemon sendat '{"at_port":"...","at_cmd":"..."}'
+        // QModem / at-daemon 期望的参数:
+        // {
+        //   "at_port": "/dev/ttyUSB0",
+        //   "at_cmd": "AT+CGMM",
+        //   "timeout": 5
+        // }
+        
         let output = timeout(
-            Duration::from_secs(self.timeout + 2), // 给 ubus 多一点时间
+            Duration::from_secs(self.timeout + 2),
             tokio::process::Command::new("ubus")
                 .arg("call")
                 .arg("at-daemon")
@@ -738,60 +755,45 @@ impl ATConnection for UbusAtDaemonConn {
         if output.status.success() {
             let stdout_str = String::from_utf8_lossy(&output.stdout);
             
-            // 解析返回的 JSON
-            // 期望格式: {"jsonrpc": "2.0", "id": 1, "result": [0, { "response": "..." }]}
-            // 但 ubus call 直接返回 result 数组的内容或者对象，这取决于具体的 ubus 实现细节。
-            // 通常 ubus call output 是 JSON 对象或数组。
-            // 根据 web_reference:
+            // at-daemon sendat 的返回格式:
+            // 1. 直接通过 ubus call: 返回一个 JSON 对象
             // {
-            //   "jsonrpc": "2.0",
-            //   "id": 1,
-            //   "result": [
-            //     0,
-            //     {
-            //       "response": "\r\nMH5000-82M\r\n\r\nOK\r\n",
-            //       ...
-            //     }
-            //   ]
+            //   "port": "/dev/ttyUSB0",
+            //   "command": "at+cgmm",
+            //   "status": "success",
+            //   "response": "\r\nMH5000-82M\r\n\r\nOK\r\n",
+            //   ...
             // }
-            // 这是通过 HTTP rpcd 调用的返回。直接 ubus call 的返回通常是 result 部分的内容。
-            // 假设 ubus call at-daemon sendat 返回的是:
-            // {
-            //    "port": "...",
-            //    "response": "...",
-            //    "status": "success"
-            // }
-            // 或者
-            // { "result": [0, {...}] }
-            // 实际上 OpenWrt 的 ubus call 输出通常是 JSON 格式的 payload。
+            // 2. 如果通过 rpcd HTTP 接口: 返回 JSON-RPC 格式
+            // { "result": [0, { ... }] }
+            //
+            // 我们这里是直接调用 ubus 命令，所以应该是情况 1。
             
-            // 尝试解析为 Value
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
-                // 尝试获取 response 字段
-                // OpenWrt ubus call 直接返回 result 内容，通常是一个对象
-                // 成功示例: { "port": "...", "command": "...", "status": "success", "response": "..." }
-                // 失败示例: 可能没有 response 字段
-                
                 let response_str = if let Some(resp) = v.get("response") {
                     resp.as_str().unwrap_or("").to_string()
                 } else {
-                     // 检查是否是数组格式（虽然通常是对象）
+                     // 兼容性处理：虽然直接调用 ubus 不太可能返回 JSON-RPC 数组，但以防万一
                      if let Some(arr) = v.as_array() {
                          if arr.len() > 1 {
-                             // 如果是 [0, {response: ...}] 格式
                              arr[1].get("response").and_then(|r| r.as_str()).unwrap_or("").to_string()
                          } else {
-                             // 可能是空数组或其他
                              "".to_string()
                          }
                      } else {
-                        // 可能是没有 response 字段的 JSON 对象
-                        // 检查是否有错误信息
                         if let Some(err) = v.get("error") {
                              format!("ERROR: {}", err)
                         } else {
-                             // 无法解析出 response，返回空字符串或原始 JSON
-                             format!("ERROR: No 'response' field in ubus output: {}", stdout_str)
+                             // 如果 status 是 failed，尝试获取 msg 或其他错误信息
+                             if let Some(status) = v.get("status") {
+                                 if status.as_str() == Some("failed") {
+                                     format!("ERROR: {}", v.get("msg").and_then(|m| m.as_str()).unwrap_or("Unknown error"))
+                                 } else {
+                                     format!("ERROR: No 'response' field in ubus output: {}", stdout_str)
+                                 }
+                             } else {
+                                 format!("ERROR: No 'response' field in ubus output: {}", stdout_str)
+                             }
                         }
                      }
                 };
@@ -838,14 +840,7 @@ impl ATClient {
                 stream: None,
             })
         } else {
-            if at_config.serial.method == "TOM_MODEM" || at_config.serial.method == "UBUS" {
-                Box::new(UbusAtDaemonConn {
-                    port: at_config.serial.port.clone(),
-                    timeout: at_config.serial.timeout,
-                    is_connected: false,
-                    response: None,
-                })
-            } else if at_config.serial.method == "QMODEM" {
+            if at_config.serial.method == "UBUS" || at_config.serial.method == "QMODEM" {
                 Box::new(UbusAtDaemonConn {
                     port: at_config.serial.port.clone(),
                     timeout: at_config.serial.timeout,

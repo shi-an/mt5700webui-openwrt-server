@@ -108,6 +108,18 @@ return view.extend({
 		o.rmempty = false;
 
 		// 串口连接配置
+		// Ubus AT守护进程选项
+		o = s.option(form.Flag, 'use_ubus', _('使用Ubus AT守护进程'));
+		o.default = '1';
+		o.depends('connection_type', 'SERIAL');
+		o.renderWidget = function(section_id, option_index, cfgvalue) {
+			var widget = form.Flag.prototype.renderWidget.apply(this, [section_id, option_index, cfgvalue]);
+			return E('div', { 'style': 'display: flex; align-items: center;' }, [
+				widget,
+				E('span', { 'style': 'margin-left: 0.5em;' }, _('启用以使用Ubus AT守护进程而非直接串口访问'))
+			]);
+		};
+
 		o = s.option(form.ListValue, 'serial_port', _('串口设备'),
 			_('选择串口设备或手动输入路径'));
 		o.depends('connection_type', 'SERIAL');
@@ -186,20 +198,6 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.depends('connection_type', 'SERIAL');
-		// 串口连接方法
-		o = s.option(form.ListValue, 'serial_method', _('连接方法'),
-			_('选择连接方法'));
-		o.value('UBUS', _('UBUS (QModem AT Daemon)'));
-		o.value('DIRECT', _('直接连接'));
-		o.default = 'UBUS';
-		o.depends('connection_type', 'SERIAL');
-
-		o = s.option(form.ListValue, 'serial_feature', _('UBUS特性'),
-			_('UBUS特性'));
-		o.value('UBUS', _('UBUS'));
-		o.value('NONE', _('无'));
-		o.default = 'UBUS';
-		o.depends('serial_method', 'UBUS');
 
 		// WebSocket配置
 		o = s.option(form.DummyValue, '_websocket_title', _('WebSocket 配置'));
