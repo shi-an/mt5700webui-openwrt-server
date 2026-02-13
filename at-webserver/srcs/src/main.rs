@@ -38,8 +38,7 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
             "PORT": "COM6", 
             "BAUDRATE": 115200, 
             "TIMEOUT": 30,
-            "METHOD": "UBUS",
-            "FEATURE": "NONE"
+            "METHOD": "UBUS"
         }
     },
     "WEBSOCKET_CONFIG": {
@@ -137,8 +136,6 @@ struct SerialConfig {
     timeout: u64,
     #[serde(rename = "METHOD")]
     method: String,
-    #[serde(rename = "FEATURE")]
-    feature: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -361,19 +358,13 @@ fn load_config_from_uci() -> Result<Config, Box<dyn Error>> {
                 .unwrap_or("UBUS")
         };
         
-        let feature = uci_data
-            .get("serial_feature")
-            .map(|s| s.as_str())
-            .unwrap_or("NONE");
-
         config.at_config.serial.method = method.to_string();
-        config.at_config.serial.feature = feature.to_string();
 
         println!(
             "配置加载: 串口连接 {} @ {} bps (超时: {}秒)",
             port, baudrate, timeout
         );
-        println!("配置加载: 串口方法 = {}, 功能 = {}", method, feature);
+        println!("配置加载: 串口方法 = {}", method);
     }
 
     // 读取 WebSocket 端口
@@ -1890,7 +1881,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("  波特率: {}", config.at_config.serial.baudrate);
         println!("  串口超时: {}秒", config.at_config.serial.timeout);
         println!("  串口方法: {}", config.at_config.serial.method);
-        println!("  串口功能: {}", config.at_config.serial.feature);
     }
 
     println!("\nWebSocket 配置:");
