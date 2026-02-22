@@ -51,7 +51,7 @@ CARGO_ENV:=CARGO_TARGET_DIR=$(PKG_BUILD_DIR)/target \
            CC="$(TARGET_CC)" \
            CXX="$(TARGET_CXX)" \
            AR="$(TARGET_AR)" \
-           RUSTFLAGS="-C linker='$(TARGET_CC)'" \
+           RUSTFLAGS="-C linker=$(filter-out ccache,$(TARGET_CC))" \
            PKG_CONFIG_ALLOW_CROSS=1 \
            CFLAGS="$(FILTERED_CFLAGS)" \
            TARGET_CFLAGS="$(FILTERED_TARGET_CFLAGS)"
