@@ -9,6 +9,7 @@ pub struct Config {
     pub notification_config: NotificationConfig,
     pub websocket_config: WebSocketConfig,
     pub schedule_config: ScheduleConfig,
+    pub advanced_network_config: AdvancedNetworkConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,15 @@ pub struct ScheduleConfig {
     pub day_nr_pcis: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdvancedNetworkConfig {
+    pub pdp_type: String,
+    pub ra_master: bool,
+    pub extend_prefix: bool,
+    pub do_not_add_dns: bool,
+    pub dns_list: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -155,6 +165,13 @@ impl Default for Config {
                 day_nr_arfcns: "".to_string(),
                 day_nr_scs_types: "".to_string(),
                 day_nr_pcis: "".to_string(),
+            },
+            advanced_network_config: AdvancedNetworkConfig {
+                pdp_type: "ipv4v6".to_string(),
+                ra_master: false,
+                extend_prefix: true,
+                do_not_add_dns: false,
+                dns_list: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
             },
         }
     }
@@ -291,6 +308,23 @@ impl Config {
         config.schedule_config.day_nr_arfcns = get_str("schedule_day_nr_arfcns", "");
         config.schedule_config.day_nr_scs_types = get_str("schedule_day_nr_scs_types", "");
         config.schedule_config.day_nr_pcis = get_str("schedule_day_nr_pcis", "");
+
+        // Advanced Network Config
+        config.advanced_network_config.pdp_type = get_str("pdp_type", "ipv4v6");
+        config.advanced_network_config.ra_master = get_bool("ra_master", false);
+        config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
+        config.advanced_network_config.do_not_add_dns = get_bool("do_not_add_dns", false);
+        
+        // Fetch dns_list separately as it's a list
+        if let Ok(output) = Command::new("uci").args(&["get", "at-webserver.config.dns_list"]).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let dns_list: Vec<String> = stdout.split_whitespace().map(|s| s.to_string()).collect();
+                if !dns_list.is_empty() {
+                    config.advanced_network_config.dns_list = dns_list;
+                }
+            }
+        }
 
         // Env var overrides (for local debugging)
         if let Ok(val) = std::env::var("AT_CONNECTION_TYPE") {

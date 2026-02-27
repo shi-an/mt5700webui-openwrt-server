@@ -7,6 +7,7 @@ mod notifications;
 mod models;
 mod pdu;
 mod schedule;
+mod network;
 
 use config::Config;
 use notifications::NotificationManager;
