@@ -29,6 +29,15 @@ impl ATClient {
     pub fn get_sender(&self) -> CommandSender {
         self.tx.clone()
     }
+
+    pub async fn send_command(&self, cmd: String) -> anyhow::Result<ATResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send((cmd, tx)).await.map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+        match rx.await {
+            Ok(resp) => Ok(resp),
+            Err(_) => Err(anyhow::anyhow!("Failed to receive response")),
+        }
+    }
 }
 
 struct ATClientActor {

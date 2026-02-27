@@ -8,6 +8,7 @@ mod models;
 mod pdu;
 mod schedule;
 mod network;
+mod dial_monitor;
 
 use config::Config;
 use notifications::NotificationManager;
@@ -36,6 +37,13 @@ async fn main() {
     let monitor_client = at_client_arc.clone();
     tokio::spawn(async move {
         schedule::monitor_loop(monitor_client, schedule_config).await;
+    });
+
+    // Spawn dial monitor
+    let dial_config = config.clone();
+    let dial_client = at_client.clone();
+    tokio::spawn(async move {
+        dial_monitor::start_monitor(dial_config, dial_client).await;
     });
 
     // Start WebSocket server
