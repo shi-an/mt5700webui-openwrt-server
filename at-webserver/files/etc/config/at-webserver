@@ -15,6 +15,14 @@ config at-webserver 'config'
 	option websocket_allow_wan '0'          # 是否允许外网访问 WebSocket (0=禁止, 1=允许)
 	option websocket_auth_key ''            # WebSocket 连接密钥（留空则不验证）
 	
+	# 高级网络拨号配置
+	option pdp_type 'ipv4v6'             # 拨号协议 (ipv4 / ipv6 / ipv4v6)
+	option ra_master '0'                 # 是否作为 IPv6 RA 主设备
+	option extend_prefix '1'             # 是否启用 IPv6 扩展前缀
+	option do_not_add_dns '0'            # 是否禁用自动获取 DNS
+	list dns_list '223.5.5.5'            # 自定义 DNS 服务器列表
+	list dns_list '119.29.29.29'
+	
 	# 通知配置
 	option wechat_webhook ''
 	option log_file ''
