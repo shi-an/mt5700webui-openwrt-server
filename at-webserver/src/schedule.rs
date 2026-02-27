@@ -1,7 +1,6 @@
 use crate::client::ATClient;
 use crate::config::ScheduleConfig;
 use crate::models::ATResponse;
-use crate::notifications::NotificationType;
 use anyhow::{anyhow, Result};
 use chrono::{Local, NaiveTime};
 use log::{error, info, warn, debug};

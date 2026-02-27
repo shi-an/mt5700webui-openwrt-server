@@ -1,7 +1,7 @@
 use crate::models::CommandSender;
 use crate::notifications::{NotificationManager, NotificationType};
 use crate::pdu::{read_incoming_sms, SmsData};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use regex::Regex;
@@ -16,7 +16,6 @@ static RE_CLIP: OnceLock<Regex> = OnceLock::new();
 static RE_CMTI: OnceLock<Regex> = OnceLock::new();
 static RE_CMGR: OnceLock<Regex> = OnceLock::new();
 static RE_PDCP: OnceLock<Regex> = OnceLock::new();
-static RE_SIGNAL: OnceLock<Regex> = OnceLock::new();
 static RE_MONSC_NR: OnceLock<Regex> = OnceLock::new();
 static RE_MONSC_LTE: OnceLock<Regex> = OnceLock::new();
 
@@ -125,7 +124,6 @@ impl MessageHandler for NewSMSHandler {
                             // Response might be:
                             // +CMGR: 0,,28\r\n0891683108501305F0040D916831...
                             // We need to find the PDU (hex string)
-                            let pdu_re = RE_CMGR.get_or_init(|| Regex::new(r#"[0-9A-F]{20,}"#).unwrap());
                             
                             // Find the last long hex string which is likely the PDU
                             // Or split by newline and find the line that looks like PDU
@@ -299,7 +297,7 @@ impl MessageHandler for NetworkSignalHandler {
                 // ^MONSC: LTE,1,1300,210,123,-90,-10,20
                 
                 let mut message = String::new();
-                let mut rat = "";
+                let mut _rat = "";
                 let mut rsrp = 0;
                 
                 let re_nr = RE_MONSC_NR.get_or_init(|| 
@@ -311,7 +309,7 @@ impl MessageHandler for NetworkSignalHandler {
                 );
 
                 if let Some(caps) = re_nr.captures(&data) {
-                    rat = "NR";
+                    _rat = "NR";
                     let arfcn = caps.get(2).map_or("", |m| m.as_str());
                     let pci = caps.get(3).map_or("", |m| m.as_str());
                     rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));
@@ -323,7 +321,7 @@ impl MessageHandler for NetworkSignalHandler {
                         arfcn, pci, rsrp, rsrq, sinr
                     );
                 } else if let Some(caps) = re_lte.captures(&data) {
-                    rat = "LTE";
+                    _rat = "LTE";
                     let arfcn = caps.get(2).map_or("", |m| m.as_str());
                     let pci = caps.get(3).map_or("", |m| m.as_str());
                     rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));

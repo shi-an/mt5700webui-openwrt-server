@@ -1,5 +1,4 @@
 use crate::client::ATClient;
-use crate::models::ATResponse;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, debug, warn};
 use serde::{Deserialize, Serialize};

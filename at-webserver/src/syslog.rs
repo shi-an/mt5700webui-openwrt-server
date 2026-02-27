@@ -1,4 +1,4 @@
-use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
 use tokio::io::AsyncWriteExt;
