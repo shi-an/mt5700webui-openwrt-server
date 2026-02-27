@@ -40,10 +40,10 @@ async fn main() {
     });
 
     // Spawn dial monitor
-    let dial_config = config.clone();
-    let dial_client = at_client.clone();
+    let monitor_config = config.clone();
+    let monitor_client = at_client.clone();
     tokio::spawn(async move {
-        dial_monitor::start_monitor(dial_config, dial_client).await;
+        dial_monitor::start_monitor(monitor_config, monitor_client).await;
     });
 
     // Start WebSocket server
