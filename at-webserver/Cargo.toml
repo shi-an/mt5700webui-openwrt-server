@@ -1,0 +1,33 @@
+[package]
+name = "at-webserver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 抛弃 full，仅引入必要的组件即可，保持应用轻量级
+tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process"] }
+warp = "0.3"
+tokio-serial = "5.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.10"
+anyhow = "1.0"
+
+# 坚决保留 rustls-tls，享受无痛的交叉编译！
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+chrono = "0.4"
+futures = "0.3"
+bytes = "1.0"
+regex = "1.9"
+hex = "0.4"
+async-trait = "0.1.89"
+
+# 基础的 Release 优化，能有效提升运行效率并去掉多余符号
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
