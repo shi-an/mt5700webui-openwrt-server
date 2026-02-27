@@ -5,6 +5,7 @@ mod server;
 mod handlers;
 mod notifications;
 mod models;
+mod pdu;
 
 use config::Config;
 use notifications::NotificationManager;
