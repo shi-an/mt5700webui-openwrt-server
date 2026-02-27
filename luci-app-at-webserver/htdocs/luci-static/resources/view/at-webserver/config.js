@@ -197,6 +197,10 @@ return view.extend({
 		o.value('ipv4v6', 'IPv4 + IPv6');
 		o.default = 'ipv4v6';
 		
+		o = s.taboption('network', form.Value, 'ifname', _('物理网卡接口'), _('模块拨号后生成的网卡名，默认 auto 自动探测（如 usb0, wwan0, eth2）'));
+		o.default = 'auto';
+		o.placeholder = 'auto';
+
 		o = s.taboption('network', form.Flag, 'ra_master', _('IPv6 RA Master'), _('启用后作为 IPv6 RA 主设备（分配 IPv6 地址）'));
 		o.default = '0';
 		o.depends('pdp_type', 'ipv6');

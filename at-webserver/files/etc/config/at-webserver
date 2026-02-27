@@ -17,6 +17,7 @@ config at-webserver 'config'
 	
 	# 高级网络拨号配置
 	option pdp_type 'ipv4v6'             # 拨号协议 (ipv4 / ipv6 / ipv4v6)
+	option ifname 'auto'                 # 绑定的网络接口名 (auto=自动探测)
 	option ra_master '0'                 # 是否作为 IPv6 RA 主设备
 	option extend_prefix '1'             # 是否启用 IPv6 扩展前缀
 	option do_not_add_dns '0'            # 是否禁用自动获取 DNS
