@@ -50,6 +50,9 @@ start_service() {
 		modprobe usbserial 2>/dev/null || true
 		modprobe option 2>/dev/null || true
 		modprobe qcserial 2>/dev/null || true
+		modprobe cdc_ether 2>/dev/null || true
+		modprobe cdc_ncm 2>/dev/null || true
+		modprobe huawei_cdc_ncm 2>/dev/null || true
 
 		# 兼容不同内核的 new_id 路径
 		local NEW_ID=""

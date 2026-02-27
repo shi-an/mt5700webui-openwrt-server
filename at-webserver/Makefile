@@ -16,7 +16,7 @@ define Package/at-webserver
   CATEGORY:=Network
   TITLE:=AT Command WebSocket Server (Rust)
   # 必须引入 ca-bundle，否则使用 rustls 请求外部 https 时会因为找不到根证书报错
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +ca-bundle +kmod-usb-net-cdc-ether +kmod-usb-net-cdc-ncm +kmod-usb-net-huawei-cdc-ncm
 endef
 
 define Package/at-webserver/description
