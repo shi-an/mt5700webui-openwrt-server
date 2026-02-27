@@ -214,6 +214,103 @@ return view.extend({
 		o.datatype = 'ipaddr';
 		o.depends('do_not_add_dns', '0');
 
+		// 1. 添加标题和主开关
+		o = s.taboption('network', form.DummyValue, '_schedule_title', '<br/><strong style="color:#0099CC;">━━━━━━━ 定时锁频 (计划任务) ━━━━━━━</strong>');
+		o.rawhtml = true;
+		o = s.taboption('network', form.Flag, 'schedule_enabled', _('启用定时锁频'));
+		o.default = '0';
+
+		// 2. 添加基础设置 (需 depends('schedule_enabled', '1'))
+		o = s.taboption('network', form.Value, 'schedule_check_interval', _('检测间隔 (秒)'));
+		o.datatype = 'uinteger';
+		o.default = '60';
+		o.depends('schedule_enabled', '1');
+
+		o = s.taboption('network', form.Value, 'schedule_timeout', _('无服务超时 (秒)'));
+		o.datatype = 'uinteger';
+		o.default = '180';
+		o.depends('schedule_enabled', '1');
+
+		o = s.taboption('network', form.Flag, 'schedule_unlock_lte', _('恢复时解锁 LTE'));
+		o.default = '1';
+		o.depends('schedule_enabled', '1');
+
+		o = s.taboption('network', form.Flag, 'schedule_unlock_nr', _('恢复时解锁 NR'));
+		o.default = '1';
+		o.depends('schedule_enabled', '1');
+
+		o = s.taboption('network', form.Flag, 'schedule_toggle_airplane', _('切换飞行模式生效'));
+		o.default = '1';
+		o.depends('schedule_enabled', '1');
+
+		// 3. 核心精简：使用数组遍历生成 日间/夜间 模式表单，防止代码冗长
+		const modes = [
+			{ prefix: 'night', name: '夜间', start: '22:00', end: '06:00' },
+			{ prefix: 'day', name: '日间' }
+		];
+
+		modes.forEach(mode => {
+			o = s.taboption('network', form.SectionValue, `_${mode.prefix}_mode_title`, form.NamedSection, 'config', 'at-webserver', `>>> ${mode.name}模式设置 <<<`);
+			o.depends('schedule_enabled', '1');
+
+			o = s.taboption('network', form.Flag, `schedule_${mode.prefix}_enabled`, _(`启用${mode.name}模式`));
+			o.default = '1';
+			o.depends('schedule_enabled', '1');
+
+			if (mode.prefix === 'night') {
+				o = s.taboption('network', form.Value, `schedule_${mode.prefix}_start`, _('开始时间'));
+				o.placeholder = mode.start;
+				o.default = mode.start;
+				o.depends(`schedule_${mode.prefix}_enabled`, '1');
+
+				o = s.taboption('network', form.Value, `schedule_${mode.prefix}_end`, _('结束时间'));
+				o.placeholder = mode.end;
+				o.default = mode.end;
+				o.depends(`schedule_${mode.prefix}_enabled`, '1');
+			}
+
+			['lte', 'nr'].forEach(net => {
+				const netName = net.toUpperCase();
+				const optPrefix = `schedule_${mode.prefix}_${net}`;
+				
+				// 添加 type
+				o = s.taboption('network', form.ListValue, `${optPrefix}_type`, _(`${mode.name} ${netName} 锁定类型`));
+				o.value('0', _('解锁'));
+				o.value('1', _('频点锁定'));
+				o.value('2', _('小区锁定'));
+				o.value('3', _('频段锁定'));
+				o.default = '3';
+				o.depends(`schedule_${mode.prefix}_enabled`, '1');
+
+				// 添加 bands
+				o = s.taboption('network', form.Value, `${optPrefix}_bands`, _(`${mode.name} ${netName} 频段`));
+				o.placeholder = net === 'lte' ? '3,8' : '78,41';
+				o.depends(`${optPrefix}_type`, '1');
+				o.depends(`${optPrefix}_type`, '2');
+				o.depends(`${optPrefix}_type`, '3');
+				o.depends('schedule_enabled', '1'); // 额外依赖
+
+				// 添加 arfcns
+				o = s.taboption('network', form.Value, `${optPrefix}_arfcns`, _(`${mode.name} ${netName} 频点`));
+				o.depends(`${optPrefix}_type`, '1');
+				o.depends(`${optPrefix}_type`, '2');
+				o.depends('schedule_enabled', '1'); // 额外依赖
+
+				// 如果是 nr，添加 scs_types
+				if (net === 'nr') {
+					o = s.taboption('network', form.Value, `${optPrefix}_scs_types`, _(`${mode.name} NR SCS 类型`));
+					o.placeholder = '1,1';
+					o.depends(`${optPrefix}_type`, '2');
+					o.depends('schedule_enabled', '1'); // 额外依赖
+				}
+
+				// 添加 pcis
+				o = s.taboption('network', form.Value, `${optPrefix}_pcis`, _(`${mode.name} ${netName} PCI`));
+				o.depends(`${optPrefix}_type`, '2');
+				o.depends('schedule_enabled', '1'); // 额外依赖
+			});
+		});
+
 		// --- WebSocket ---
 
 		o = s.taboption('websocket', form.Value, 'websocket_port', _('WebSocket 端口'),
