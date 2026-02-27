@@ -104,6 +104,7 @@ pub struct ScheduleConfig {
 #[derive(Debug, Clone)]
 pub struct AdvancedNetworkConfig {
     pub pdp_type: String,
+    pub ifname: String,
     pub ra_master: bool,
     pub extend_prefix: bool,
     pub do_not_add_dns: bool,
@@ -177,6 +178,7 @@ impl Default for Config {
             },
             advanced_network_config: AdvancedNetworkConfig {
                 pdp_type: "ipv4v6".to_string(),
+                ifname: "auto".to_string(),
                 ra_master: false,
                 extend_prefix: true,
                 do_not_add_dns: false,
@@ -326,6 +328,7 @@ impl Config {
 
         // Advanced Network Config
         config.advanced_network_config.pdp_type = get_str("pdp_type", "ipv4v6");
+        config.advanced_network_config.ifname = get_str("ifname", "auto");
         config.advanced_network_config.ra_master = get_bool("ra_master", false);
         config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
         config.advanced_network_config.do_not_add_dns = get_bool("do_not_add_dns", false);
