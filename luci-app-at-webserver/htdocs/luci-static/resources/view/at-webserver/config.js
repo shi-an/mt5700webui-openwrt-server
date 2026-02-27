@@ -360,9 +360,80 @@ return view.extend({
 		o.rawhtml = true;
 		o.cfgvalue = function() { return '<h3>' + _('短信与事件通知配置') + '</h3>'; };
 
-		o = s.taboption('notify', form.Value, 'wechat_webhook', _('企业微信 Webhook'),
-			_('企业微信机器人的 Webhook 地址，留空则不启用微信通知'));
+		// 第三方推送通道多选
+		o = s.taboption('notify', form.MultiValue, 'enabled_push_services', _('第三方推送通道'), _('勾选需要启用的通道，对应的配置框会自动展开'));
+		o.value('wechat', '企业微信');
+		o.value('pushplus', 'PushPlus');
+		o.value('serverchan', 'Server酱');
+		o.value('pushdeer', 'PushDeer');
+		o.value('feishu', '飞书');
+		o.value('dingtalk', '钉钉');
+		o.value('bark', 'Bark');
+		o.value('telegram', 'Telegram Bot');
+		o.value('generic', '通用 Webhook');
+		o.value('custom', '自定义脚本');
+		o.default = '';
+
+		// 1. 企业微信 (原 wechat_webhook)
+		o = s.taboption('notify', form.Value, 'wechat_webhook', _('企业微信 Webhook'), _('企业微信机器人的 Webhook 地址'));
 		o.placeholder = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...';
+		o.depends('enabled_push_services', 'wechat');
+
+		// 2. PushPlus
+		o = s.taboption('notify', form.Value, 'pushplus_token', _('PushPlus Token'), _('PushPlus 用户令牌'));
+		o.placeholder = 'your_token_here';
+		o.depends('enabled_push_services', 'pushplus');
+
+		// 3. Server酱
+		o = s.taboption('notify', form.Value, 'serverchan_key', _('Server酱 SendKey'), _('Server酱 SendKey'));
+		o.placeholder = 'SCT...';
+		o.depends('enabled_push_services', 'serverchan');
+
+		// 4. PushDeer
+		o = s.taboption('notify', form.Value, 'pushdeer_key', _('PushDeer Key'), _('PushDeer PushKey'));
+		o.placeholder = 'PDU...';
+		o.depends('enabled_push_services', 'pushdeer');
+		
+		o = s.taboption('notify', form.Value, 'pushdeer_url', _('PushDeer Server'), _('自建 PushDeer 服务器地址，留空使用官方服务器'));
+		o.placeholder = 'https://api2.pushdeer.com';
+		o.depends('enabled_push_services', 'pushdeer');
+
+		// 5. 飞书
+		o = s.taboption('notify', form.Value, 'feishu_webhook', _('飞书 Webhook'), _('飞书群机器人 Webhook 地址'));
+		o.placeholder = 'https://open.feishu.cn/open-apis/bot/v2/hook/...';
+		o.depends('enabled_push_services', 'feishu');
+
+		// 6. 钉钉
+		o = s.taboption('notify', form.Value, 'dingtalk_webhook', _('钉钉 Webhook'), _('钉钉群机器人 Webhook 地址'));
+		o.placeholder = 'https://oapi.dingtalk.com/robot/send?access_token=...';
+		o.depends('enabled_push_services', 'dingtalk');
+		
+		o = s.taboption('notify', form.Value, 'dingtalk_secret', _('钉钉加签密钥'), _('钉钉机器人加签密钥（可选）'));
+		o.depends('enabled_push_services', 'dingtalk');
+
+		// 7. Bark
+		o = s.taboption('notify', form.Value, 'bark_url', _('Bark Server'), _('Bark 服务器地址 (例如 https://api.day.app/YOUR_KEY/)'));
+		o.placeholder = 'https://api.day.app/YOUR_KEY/';
+		o.depends('enabled_push_services', 'bark');
+
+		// 8. Telegram Bot
+		o = s.taboption('notify', form.Value, 'tg_bot_token', _('TG Bot Token'), _('Telegram 机器人 Token'));
+		o.placeholder = '123456789:ABC...';
+		o.depends('enabled_push_services', 'telegram');
+
+		o = s.taboption('notify', form.Value, 'tg_chat_id', _('TG Chat ID'), _('接收通知的 Chat ID'));
+		o.placeholder = '123456789';
+		o.depends('enabled_push_services', 'telegram');
+
+		// 9. 通用 Webhook
+		o = s.taboption('notify', form.Value, 'generic_webhook_url', _('Webhook URL'), _('通用的 POST 请求地址'));
+		o.placeholder = 'https://example.com/api/notify';
+		o.depends('enabled_push_services', 'generic');
+
+		// 10. 自定义脚本
+		o = s.taboption('notify', form.Value, 'custom_script_path', _('脚本路径'), _('当有通知时执行的脚本路径'));
+		o.placeholder = '/usr/bin/my-notify-script.sh';
+		o.depends('enabled_push_services', 'custom');
 
 		o = s.taboption('notify', form.Value, 'log_file', _('通知记录文件'),
 			_('保存通知记录的日志文件路径，留空则不启用日志记录'));

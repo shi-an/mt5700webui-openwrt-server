@@ -44,7 +44,20 @@ pub struct SerialConfig {
 
 #[derive(Debug, Clone)]
 pub struct NotificationConfig {
+    pub enabled_push_services: Vec<String>,
     pub wechat_webhook: Option<String>,
+    pub pushplus_token: Option<String>,
+    pub serverchan_key: Option<String>,
+    pub pushdeer_key: Option<String>,
+    pub pushdeer_url: Option<String>,
+    pub feishu_webhook: Option<String>,
+    pub dingtalk_webhook: Option<String>,
+    pub dingtalk_secret: Option<String>,
+    pub bark_url: Option<String>,
+    pub tg_bot_token: Option<String>,
+    pub tg_chat_id: Option<String>,
+    pub generic_webhook_url: Option<String>,
+    pub custom_script_path: Option<String>,
     pub log_file: Option<String>,
     pub notify_sms: bool,
     pub notify_call: bool,
@@ -128,7 +141,20 @@ impl Default for Config {
                 },
             },
             notification_config: NotificationConfig {
+                enabled_push_services: Vec::new(),
                 wechat_webhook: None,
+                pushplus_token: None,
+                serverchan_key: None,
+                pushdeer_key: None,
+                pushdeer_url: None,
+                feishu_webhook: None,
+                dingtalk_webhook: None,
+                dingtalk_secret: None,
+                bark_url: None,
+                tg_bot_token: None,
+                tg_chat_id: None,
+                generic_webhook_url: None,
+                custom_script_path: None,
                 log_file: None,
                 notify_sms: true,
                 notify_call: true,
@@ -275,8 +301,50 @@ impl Config {
         config.at_config.serial.timeout = get_int("serial_timeout", 10);
 
         // Notification Config
+        let enabled_services_str = get_str("enabled_push_services", "");
+        config.notification_config.enabled_push_services = enabled_services_str
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
         let wechat = get_str("wechat_webhook", "");
         config.notification_config.wechat_webhook = if wechat.is_empty() { None } else { Some(wechat) };
+
+        let pushplus = get_str("pushplus_token", "");
+        config.notification_config.pushplus_token = if pushplus.is_empty() { None } else { Some(pushplus) };
+
+        let serverchan = get_str("serverchan_key", "");
+        config.notification_config.serverchan_key = if serverchan.is_empty() { None } else { Some(serverchan) };
+
+        let pushdeer_key = get_str("pushdeer_key", "");
+        config.notification_config.pushdeer_key = if pushdeer_key.is_empty() { None } else { Some(pushdeer_key) };
+
+        let pushdeer_url = get_str("pushdeer_url", "");
+        config.notification_config.pushdeer_url = if pushdeer_url.is_empty() { None } else { Some(pushdeer_url) };
+
+        let feishu = get_str("feishu_webhook", "");
+        config.notification_config.feishu_webhook = if feishu.is_empty() { None } else { Some(feishu) };
+
+        let dingtalk = get_str("dingtalk_webhook", "");
+        config.notification_config.dingtalk_webhook = if dingtalk.is_empty() { None } else { Some(dingtalk) };
+
+        let dingtalk_secret = get_str("dingtalk_secret", "");
+        config.notification_config.dingtalk_secret = if dingtalk_secret.is_empty() { None } else { Some(dingtalk_secret) };
+
+        let bark = get_str("bark_url", "");
+        config.notification_config.bark_url = if bark.is_empty() { None } else { Some(bark) };
+
+        let tg_token = get_str("tg_bot_token", "");
+        config.notification_config.tg_bot_token = if tg_token.is_empty() { None } else { Some(tg_token) };
+
+        let tg_chat_id = get_str("tg_chat_id", "");
+        config.notification_config.tg_chat_id = if tg_chat_id.is_empty() { None } else { Some(tg_chat_id) };
+
+        let generic = get_str("generic_webhook_url", "");
+        config.notification_config.generic_webhook_url = if generic.is_empty() { None } else { Some(generic) };
+
+        let custom_script = get_str("custom_script_path", "");
+        config.notification_config.custom_script_path = if custom_script.is_empty() { None } else { Some(custom_script) };
 
         let log_file = get_str("log_file", "");
         config.notification_config.log_file = if log_file.is_empty() { None } else { Some(log_file) };
