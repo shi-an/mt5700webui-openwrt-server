@@ -6,13 +6,13 @@ use std::time::Duration;
 use tokio::time::sleep;
 use anyhow::Result;
 
+use tokio::fs;
+
 pub async fn start_monitor(config: Config, at_client: ATClient) {
     info!("Starting dial monitor...");
     
     // Track connection state to avoid repeated setup
     let mut is_connected = false;
-    // Default interface name, can be made configurable later
-    const IFNAME: &str = "eth1"; 
 
     loop {
         // Check IP status
@@ -23,8 +23,12 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         info!("IP address detected. Marking as connected.");
                         is_connected = true;
                         
+                        // Detect interface
+                        let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
+                        info!("Auto-detected 5G interface: {}", actual_ifname);
+                        
                         // Execute network setup script
-                        if let Err(e) = network::setup_modem_network(&config, IFNAME).await {
+                        if let Err(e) = network::setup_modem_network(&config, &actual_ifname).await {
                             error!("Failed to setup modem network: {}", e);
                             // We don't set is_connected to false here, to avoid retrying setup immediately 
                             // unless we lose IP. But maybe we should? 
@@ -125,4 +129,41 @@ async fn perform_dial(config: &Config, at_client: &ATClient) -> Result<()> {
     let _ = at_client.send_command("AT+CGACT=1,1".to_string()).await;
     
     Ok(())
+}
+
+async fn detect_modem_ifname(configured: &str) -> String {
+    if !configured.is_empty() && configured != "auto" {
+        return configured.to_string();
+    }
+
+    let mut found_ifnames = Vec::new();
+    if let Ok(mut entries) = fs::read_dir("/sys/class/net/").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                // Filter out known local/bridge interfaces
+                if file_name == "lo" || file_name == "br-lan" || file_name == "eth0" {
+                    continue;
+                }
+                found_ifnames.push(file_name);
+            }
+        }
+    }
+
+    // Priority 1: usb*
+    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("usb")) {
+        return name.clone();
+    }
+
+    // Priority 2: wwan*
+    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("wwan")) {
+        return name.clone();
+    }
+
+    // Priority 3: eth* (excluding eth0 which is already filtered)
+    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("eth")) {
+        return name.clone();
+    }
+
+    // Fallback
+    "eth1".to_string()
 }
