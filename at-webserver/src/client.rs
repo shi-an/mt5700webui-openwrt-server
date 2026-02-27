@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::connection::{ATConnection, NetworkATConnection, SerialATConnection};
-use crate::handlers::{CallHandler, MemoryFullHandler, MessageHandler, NewSMSHandler};
+use crate::handlers::{CallHandler, MemoryFullHandler, MessageHandler, NetworkSignalHandler, NewSMSHandler, PDCPDataHandler};
 use crate::models::{ATResponse, CommandSender, ConnectionType};
 use crate::notifications::NotificationManager;
 use log::{error, info, warn, debug};
@@ -52,6 +52,8 @@ impl ATClientActor {
             Box::new(CallHandler),
             Box::new(MemoryFullHandler),
             Box::new(NewSMSHandler),
+            Box::new(PDCPDataHandler),
+            Box::new(NetworkSignalHandler),
         ];
 
         Self {
@@ -62,36 +64,6 @@ impl ATClientActor {
             handlers,
             cmd_tx,
             buffer: Vec::new(),
-        }
-    }
-
-    async fn connect(&mut self) -> bool {
-        let mut conn: Box<dyn ATConnection> = match self.config.at_config.connection_type {
-            ConnectionType::Network => {
-                Box::new(NetworkATConnection::new(
-                    self.config.at_config.network.host.clone(),
-                    self.config.at_config.network.port,
-                    self.config.at_config.network.timeout,
-                ))
-            }
-            ConnectionType::Serial => {
-                Box::new(SerialATConnection::new(
-                    self.config.at_config.serial.port.clone(),
-                    self.config.at_config.serial.baudrate,
-                ))
-            }
-        };
-
-        match conn.connect().await {
-            Ok(_) => {
-                self.connection = Some(conn);
-                info!("AT Client connected");
-                true
-            }
-            Err(e) => {
-                error!("Connection failed: {}", e);
-                false
-            }
         }
     }
 
@@ -106,6 +78,35 @@ impl ATClientActor {
             
             self.process_loop().await;
             sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn connect(&mut self) -> bool {
+        let mut connection: Box<dyn ATConnection> = match self.config.at_config.connection_type {
+            ConnectionType::Network => {
+                Box::new(NetworkATConnection::new(
+                    self.config.at_config.network.host.clone(),
+                    self.config.at_config.network.port,
+                    self.config.at_config.network.timeout,
+                ))
+            },
+            ConnectionType::Serial => {
+                Box::new(SerialATConnection::new(
+                    self.config.at_config.serial.port.clone(),
+                    self.config.at_config.serial.baudrate,
+                ))
+            }
+        };
+
+        match connection.connect().await {
+            Ok(_) => {
+                self.connection = Some(connection);
+                true
+            }
+            Err(e) => {
+                error!("Failed to connect: {}", e);
+                false
+            }
         }
     }
 
@@ -271,21 +272,12 @@ impl ATClientActor {
 
 fn extract_next_line(buffer: &mut Vec<u8>) -> Option<String> {
     if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-         let remaining = buffer.split_off(pos + 1);
-         let mut line_bytes = buffer.clone();
-         *buffer = remaining; // update buffer to remaining
-         
-         // Remove \n and optional \r
-         if let Some(&last) = line_bytes.last() {
-             if last == b'\n' { line_bytes.pop(); }
-         }
-         if let Some(&last) = line_bytes.last() {
-             if last == b'\r' { line_bytes.pop(); }
-         }
-
-         let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-         if line.is_empty() { return extract_next_line(buffer); }
-         return Some(line);
+        let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
+        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        if line.is_empty() {
+            return extract_next_line(buffer);
+        }
+        return Some(line);
     }
     None
 }
