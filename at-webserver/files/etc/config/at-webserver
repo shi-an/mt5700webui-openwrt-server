@@ -72,3 +72,9 @@ config at-webserver 'config'
 	option schedule_day_nr_scs_types ''      # NR SCS类型
 	option schedule_day_nr_pcis ''           # NR PCI
 
+	# 系统日志配置
+	option sys_log_enable '1'                  # 是否启用系统日志记录
+	option sys_log_persist '0'                 # 是否持久化保存 (0=临时目录, 1=持久目录)
+	option sys_log_path_temp '/tmp/at-webserver.log'    # 临时日志路径
+	option sys_log_path_persist '/etc/at-webserver.log' # 持久化日志路径
+

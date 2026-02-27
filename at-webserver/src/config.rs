@@ -10,6 +10,15 @@ pub struct Config {
     pub websocket_config: WebSocketConfig,
     pub schedule_config: ScheduleConfig,
     pub advanced_network_config: AdvancedNetworkConfig,
+    pub sys_log_config: SysLogConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SysLogConfig {
+    pub enable: bool,
+    pub persist: bool,
+    pub path_temp: String,
+    pub path_persist: String,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +182,12 @@ impl Default for Config {
                 do_not_add_dns: false,
                 dns_list: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
             },
+            sys_log_config: SysLogConfig {
+                enable: true,
+                persist: false,
+                path_temp: "/tmp/at-webserver.log".to_string(),
+                path_persist: "/etc/at-webserver.log".to_string(),
+            },
         }
     }
 }
@@ -325,6 +340,12 @@ impl Config {
                 }
             }
         }
+
+        // SysLog Config
+        config.sys_log_config.enable = get_bool("sys_log_enable", true);
+        config.sys_log_config.persist = get_bool("sys_log_persist", false);
+        config.sys_log_config.path_temp = get_str("sys_log_path_temp", "/tmp/at-webserver.log");
+        config.sys_log_config.path_persist = get_str("sys_log_path_persist", "/etc/at-webserver.log");
 
         // Env var overrides (for local debugging)
         if let Ok(val) = std::env::var("AT_CONNECTION_TYPE") {
