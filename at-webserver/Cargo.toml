@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # 抛弃 full，仅引入必要的组件即可，保持应用轻量级
-tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process"] }
+tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process", "fs"] }
 warp = "0.3"
 tokio-serial = "5.4"
 serde = { version = "1.0", features = ["derive"] }

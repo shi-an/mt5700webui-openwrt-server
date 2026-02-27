@@ -7,8 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
 use tokio::process::Command;
 use urlencoding::encode;
 
@@ -96,9 +94,11 @@ struct ServerChan { key: String, client: Client }
 impl NotificationChannel for ServerChan {
     async fn send(&self, msg: &NotificationMessage) -> Result<()> {
         let url = format!("https://sctapi.ftqq.com/{}.send", self.key);
-        let params = [("title", &msg.sender), ("desp", &msg.content)];
+        let sender = msg.sender.clone();
+        let content = msg.content.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
+            let params = [("title", sender), ("desp", content)];
             if let Err(e) = client.post(url).form(&params).send().await {
                 warn!("ServerChan notification failed: {}", e);
             }
@@ -149,12 +149,12 @@ impl NotificationChannel for Feishu {
     }
 }
 
-struct DingTalk { webhook: String, secret: Option<String>, client: Client }
+struct DingTalk { webhook: String, _secret: Option<String>, client: Client }
 #[async_trait]
 impl NotificationChannel for DingTalk {
     async fn send(&self, msg: &NotificationMessage) -> Result<()> {
-        let mut url = self.webhook.clone();
-        if let Some(secret) = &self.secret {
+        let url = self.webhook.clone();
+        if let Some(_secret) = &self._secret {
             // DingTalk signature logic could be added here if needed, but requirements just mentioned webhook/secret config
             // Simple appending if user provided a signed URL or just ignore secret if not implementing signing logic
             // For now, we assume webhook contains token. If signing is needed, it requires timestamp + secret HMAC
@@ -338,7 +338,7 @@ impl NotificationManager {
                 },
                 "dingtalk" => {
                     if let Some(url) = &config.dingtalk_webhook {
-                        channels.push(Box::new(DingTalk { webhook: url.clone(), secret: config.dingtalk_secret.clone(), client: client.clone() }));
+                        channels.push(Box::new(DingTalk { webhook: url.clone(), _secret: config.dingtalk_secret.clone(), client: client.clone() }));
                         info!("已启用 钉钉 推送");
                     }
                 },
