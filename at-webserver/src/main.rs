@@ -9,6 +9,7 @@ mod pdu;
 mod schedule;
 mod network;
 mod dial_monitor;
+mod syslog;
 
 use config::Config;
 use notifications::NotificationManager;
@@ -22,11 +23,12 @@ async fn main() {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    env_logger::init();
+    
+    let config = Config::load();
+    let log_rx = syslog::init(&config);
     
     info!("Starting AT Webserver (Rust Version)...");
     
-    let config = Config::load();
     let notifications = NotificationManager::new(config.notification_config.clone());
     
     let at_client = ATClient::new(config.clone(), notifications);
@@ -51,6 +53,8 @@ async fn main() {
         config.websocket_config.ipv4.port, 
         config.websocket_config.ipv6.port,
         config.websocket_config.auth_key.clone(),
-        at_client
+        at_client,
+        log_rx,
+        config.sys_log_config.persist.then(|| config.sys_log_config.path_persist.clone()).unwrap_or(config.sys_log_config.path_temp.clone())
     ).await;
 }
