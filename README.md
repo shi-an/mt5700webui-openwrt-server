@@ -79,3 +79,9 @@ opkg install /tmp/luci-app-at-webserver_*.ipk
 ## 📄 许可证
 
 MIT License
+
+## 🙏 致谢
+
+本项目的部分设计灵感和实现参考了以下优秀项目：
+
+*   [**QModem**](https://github.com/FUjr/QModem): 感谢 QModem 提供的关于 OpenWrt 模组管理的思路和部分实现参考。
