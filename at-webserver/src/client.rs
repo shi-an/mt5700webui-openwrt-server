@@ -48,6 +48,7 @@ struct ATClientActor {
     handlers: Vec<Box<dyn MessageHandler>>,
     cmd_tx: CommandSender,
     buffer: Vec<u8>,
+    urc_tx: mpsc::Sender<String>, // 新增专门用于分发 URC 的通道
 }
 
 impl ATClientActor {
@@ -57,6 +58,29 @@ impl ATClientActor {
         rx: mpsc::Receiver<(String, oneshot::Sender<ATResponse>)>,
         cmd_tx: CommandSender,
     ) -> Self {
+        // 建立一个解耦的 URC 分发通道
+        let (urc_tx, mut urc_rx) = mpsc::channel::<String>(100);
+        let notifs = notifications.clone();
+        let cmd_tx_clone = cmd_tx.clone();
+        
+        // 【解除死锁的核心】：在独立的后台协程中处理 URC，防止 Handler 再次发送 AT 指令时阻塞主 Actor
+        tokio::spawn(async move {
+            let mut async_handlers: Vec<Box<dyn MessageHandler>> = vec![
+                Box::new(CallHandler),
+                Box::new(MemoryFullHandler),
+                Box::new(NewSMSHandler),
+                Box::new(PDCPDataHandler),
+                Box::new(NetworkSignalHandler),
+            ];
+            while let Some(line) = urc_rx.recv().await {
+                for handler in &mut async_handlers {
+                    if handler.can_handle(&line) {
+                        let _ = handler.handle(&line, &notifs, &cmd_tx_clone).await;
+                    }
+                }
+            }
+        });
+
         let handlers: Vec<Box<dyn MessageHandler>> = vec![
             Box::new(CallHandler),
             Box::new(MemoryFullHandler),
@@ -73,6 +97,7 @@ impl ATClientActor {
             handlers,
             cmd_tx,
             buffer: Vec::new(),
+            urc_tx,
         }
     }
 
@@ -144,6 +169,7 @@ impl ATClientActor {
                         &self.handlers, 
                         &self.notifications, 
                         &self.cmd_tx, 
+                        &self.urc_tx,
                         cmd, 
                         reply_tx
                     ).await {
@@ -162,7 +188,8 @@ impl ATClientActor {
                                 &mut self.buffer, 
                                 &self.handlers, 
                                 &self.notifications, 
-                                &self.cmd_tx
+                                &self.cmd_tx,
+                                &self.urc_tx
                             ).await;
                         }
                         Ok(_) => {
@@ -187,6 +214,7 @@ impl ATClientActor {
         handlers: &[Box<dyn MessageHandler>],
         notifications: &NotificationManager,
         cmd_tx: &CommandSender,
+        urc_tx: &mpsc::Sender<String>,
         cmd: String,
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
@@ -218,24 +246,24 @@ impl ATClientActor {
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
                         
+                        // 遇到 URC，推送到后台队列处理，主 Actor 继续畅通无阻
                         if Self::is_urc(handlers, &line) {
-                            Self::handle_urc(handlers, &line, notifications, cmd_tx).await;
+                            let _ = urc_tx.send(line).await;
                             continue;
                         }
-
-                        // Append non-URC lines exactly
-                        response_data.push_str(&line);
-                        response_data.push_str("\r\n");
-
+                        // 恢复 Vue 依赖的格式：绝不将 OK 放入 payload，直接 trim！
                         if line == "OK" {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string())));
                              return Ok(());
                         } else if line.contains("ERROR") {
-                             let _ = reply_tx.send(ATResponse::error(response_data));
+                             let _ = reply_tx.send(ATResponse::error(format!("AT Error: {}", line)));
                              return Ok(());
                         } else if line.starts_with(">") {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data))); 
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string()))); 
                              return Ok(());
+                        } else {
+                             response_data.push_str(&line);
+                             response_data.push('\n');
                         }
                     }
                 },
@@ -254,11 +282,14 @@ impl ATClientActor {
         buffer: &mut Vec<u8>,
         handlers: &[Box<dyn MessageHandler>],
         notifications: &NotificationManager,
-        cmd_tx: &CommandSender
+        cmd_tx: &CommandSender,
+        urc_tx: &mpsc::Sender<String>
     ) {
          while let Some(line) = extract_next_line(buffer) {
              debug!("URC/Idle: {}", line);
-             Self::handle_urc(handlers, &line, notifications, cmd_tx).await;
+             if Self::is_urc(handlers, &line) {
+                 let _ = urc_tx.send(line).await;
+             }
          }
     }
 
@@ -267,21 +298,6 @@ impl ATClientActor {
             if handler.can_handle(line) { return true; }
         }
         false
-    }
-    
-    async fn handle_urc(
-        handlers: &[Box<dyn MessageHandler>], 
-        line: &str, 
-        notifications: &NotificationManager, 
-        cmd_tx: &CommandSender
-    ) {
-        for handler in handlers {
-            if handler.can_handle(line) {
-                if let Err(e) = handler.handle(line, notifications, cmd_tx).await {
-                    error!("Handler error: {}", e);
-                }
-            }
-        }
     }
 }
 

@@ -227,10 +227,18 @@ async fn handle_client(
 
                                 match resp_rx.await {
                                     Ok(response) => {
-                                        // 绝对不要对 AT 结果做任何裁剪，原汁原味返回给前端
+                                        // 务必过滤掉发送的回显命令，只保留数据载荷，Vue前端严格依赖此格式！
+                                        let mut filtered_data = response.data.clone();
+                                        if let Some(data) = &filtered_data {
+                                            let clean_cmd = cmd_str.trim();
+                                            let lines: Vec<&str> = data.lines()
+                                                .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
+                                                .collect();
+                                            filtered_data = Some(lines.join("\n"));
+                                        }
                                         let ws_resp = WSResponse {
                                             success: response.success,
-                                            data: response.data,
+                                            data: filtered_data,
                                             error: response.error,
                                         };
                                         let json_resp = serde_json::to_string(&ws_resp).unwrap();
