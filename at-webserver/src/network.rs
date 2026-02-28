@@ -62,14 +62,34 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         }
     }
 
-    // Apply changes
-    info!("Applying network changes...");
-    run_uci(&["commit", "network"]).await?;
-    run_uci(&["commit", "dhcp"]).await?;
+    // Apply changes and restart specific interfaces only
+    info!("Applying network changes and bringing up modem interface...");
     
-    // Restart services
-    run_command("/etc/init.d/network", &["restart"]).await?;
-    run_command("/etc/init.d/dhcp", &["restart"]).await?;
+    // Commit UCI changes
+    if let Err(e) = run_uci(&["commit", "network"]).await {
+        error!("Failed to commit network config: {}", e);
+    }
+    if let Err(e) = run_uci(&["commit", "dhcp"]).await {
+        error!("Failed to commit dhcp config: {}", e);
+    }
+    
+    // Bring up the modem interface specifically
+    // Note: ifup wan_modem will tell netifd to reload this interface config if it changed
+    if let Err(e) = run_command("ifup", &["wan_modem"]).await {
+        error!("Failed to ifup wan_modem: {}", e);
+    }
+    
+    if pdp_type.contains("ipv6") {
+        if let Err(e) = run_command("ifup", &["wan_modem6"]).await {
+             error!("Failed to ifup wan_modem6: {}", e);
+        }
+    }
+
+    // Firewall reload is usually safe and non-disruptive
+    if let Err(_) = run_command("/etc/init.d/firewall", &["reload"]).await {
+        warn!("Failed to reload firewall via init.d, trying fw4...");
+        let _ = run_command("fw4", &["reload"]).await;
+    }
     
     info!("Network configuration completed.");
     Ok(())
