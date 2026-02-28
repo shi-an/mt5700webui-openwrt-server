@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::process::Command;
 
 pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
