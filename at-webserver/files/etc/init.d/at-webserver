@@ -219,52 +219,21 @@ start_service() {
 }
 
 stop_service() {
-	logger -t at-webserver "停止服务..."
-	echo "Stopping AT WebServer..."
-	
-	# 清理防火墙规则
-	# 清理 WebSocket WAN 阻止规则
-	local rule_name="at_webserver_wan_block"
-	local rule_idx=$(uci show firewall | grep "\.name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1 | head -n1)
-	if [ -n "$rule_idx" ]; then
-		uci delete firewall.@rule[$rule_idx] 2>/dev/null
-	fi
-	
-	# 清理 WebSocket WAN 允许规则
-	rule_name="at_webserver_wan_allow"
-	rule_idx=$(uci show firewall | grep "\.name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1 | head -n1)
-	if [ -n "$rule_idx" ]; then
-		uci delete firewall.@rule[$rule_idx] 2>/dev/null
-	fi
-	
-	# 清理模块 LAN 访问限制规则
-	rule_name="at_module_restrict"
-	rule_idx=$(uci show firewall | grep "\.name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1 | head -n1)
-	if [ -n "$rule_idx" ]; then
-		uci delete firewall.@rule[$rule_idx] 2>/dev/null
-	fi
-	
-	# 清理模块 WAN 阻止规则
-	rule_name="at_module_wan_block"
-	rule_idx=$(uci show firewall | grep "\.name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1 | head -n1)
-	if [ -n "$rule_idx" ]; then
-		uci delete firewall.@rule[$rule_idx] 2>/dev/null
-	fi
-	
-	# 清理模块 WAN 允许规则
-	rule_name="at_module_wan_allow"
-	rule_idx=$(uci show firewall | grep "\.name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1 | head -n1)
-	if [ -n "$rule_idx" ]; then
-		uci delete firewall.@rule[$rule_idx] 2>/dev/null
-	fi
-	
-	uci commit firewall
-	/etc/init.d/firewall reload >/dev/null 2>&1
-	logger -t at-webserver "已清理所有防火墙规则"
-	
-	sleep 1
-	logger -t at-webserver "服务已停止"
-	echo "AT WebServer stopped"
+    # 1. 停止网络接口
+    ifdown wan_modem 2>/dev/null
+    ifdown wan_modem6 2>/dev/null
+    # 2. 删除 UCI 配置
+    uci -q delete network.wan_modem
+    uci -q delete network.wan_modem6
+    uci commit network
+    # 3. 从防火墙剥离
+    WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
+    [ -n "$WAN_ZONE" ] && {
+        uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
+        uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
+        uci commit firewall
+        fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+    }
 }
 
 service_triggers() {

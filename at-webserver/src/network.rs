@@ -24,24 +24,12 @@ pub async fn setup_modem_network(_config: &Config, ifname: &str) -> Result<()> {
         uci set network.wan_modem6.reqaddress='try'
         uci set network.wan_modem6.reqprefix='auto'
         
-        # 4. 动态寻找 wan 防火墙区域并加入新接口
-        WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
-        if [ -n "$WAN_ZONE" ]; then
-            uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
-            uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
-            uci add_list firewall.$WAN_ZONE.network='wan_modem'
-            uci add_list firewall.$WAN_ZONE.network='wan_modem6'
-        fi
-        
-        # 5. 提交配置落盘
+        # 4. 提交配置落盘
         uci commit network
-        uci commit firewall
         
-        # 6. 精确拉起 5G 接口 (不影响本地 LAN/WiFi)
+        # 5. 精确拉起 5G 接口 (不影响本地 LAN/WiFi)
         ifup wan_modem
         ifup wan_modem6
-        
-        /etc/init.d/firewall reload 2>/dev/null || fw4 reload 2>/dev/null
     "#, ifname);
 
     info!("Executing UCI script for network setup...");
@@ -60,8 +48,41 @@ pub async fn setup_modem_network(_config: &Config, ifname: &str) -> Result<()> {
         error!("UCI script failed: {}", stderr);
         return Err(anyhow::anyhow!("UCI script failed: {}", stderr));
     }
+
+    // 精准绑定到防火墙 wan 区域并重载
+    let fw_script = r#"
+        WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
+        if [ -n "$WAN_ZONE" ]; then
+            uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
+            uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
+            uci add_list firewall.$WAN_ZONE.network='wan_modem'
+            uci add_list firewall.$WAN_ZONE.network='wan_modem6'
+            uci commit firewall
+            /etc/init.d/firewall reload 2>/dev/null || fw4 reload 2>/dev/null
+        fi
+        exit 0
+    "#;
+    let _ = run_command("sh", &["-c", fw_script]).await;
     
     info!("Network configuration completed.");
+    Ok(())
+}
+
+async fn run_command(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| {
+            error!("Failed to execute {}: {}", program, e);
+            e
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("Command {} {:?} failed: {}", program, args, stderr);
+        return Err(anyhow::anyhow!("Command failed"));
+    }
     Ok(())
 }
 
