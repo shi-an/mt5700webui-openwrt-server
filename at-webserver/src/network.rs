@@ -5,7 +5,23 @@ use tokio::process::Command;
 
 pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     info!("Configuring modem network for interface: {}", ifname);
-    let pdp_type = &config.advanced_network_config.pdp_type;
+    let net_config = &config.advanced_network_config;
+    let pdp_type = &net_config.pdp_type;
+
+    // Generate DNS configuration script based on list
+    let mut dns_script = String::new();
+    if !net_config.dns_list.is_empty() {
+        // User provided DNS list, force use custom DNS
+        dns_script.push_str("uci set network.wan_modem.peerdns=0\n");
+        dns_script.push_str("uci -q delete network.wan_modem.dns\n");
+        for dns in &net_config.dns_list {
+            dns_script.push_str(&format!("uci add_list network.wan_modem.dns='{}'\n", dns));
+        }
+    } else {
+        // Empty list, use carrier DNS
+        dns_script.push_str("uci set network.wan_modem.peerdns=1\n");
+        dns_script.push_str("uci -q delete network.wan_modem.dns\n");
+    }
     
     let uci_script = format!(r#"
         # 1. 清理旧配置
@@ -17,6 +33,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         uci set network.wan_modem.proto='dhcp'
         uci set network.wan_modem.device='{}'
         uci set network.wan_modem.metric='10'
+        {}
         
         # 3. 配置 IPv6 接口 (作为 IPv4 的别名，完美复刻 QModem)
         uci set network.wan_modem6=interface
@@ -27,7 +44,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         
         # 4. 提交配置落盘
         uci commit network
-    "#, ifname);
+    "#, ifname, dns_script);
 
     info!("Executing UCI script for network setup...");
     let output = Command::new("sh")

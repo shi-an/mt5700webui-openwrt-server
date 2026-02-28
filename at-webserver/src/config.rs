@@ -120,7 +120,6 @@ pub struct AdvancedNetworkConfig {
     pub ifname: String,
     pub ra_master: bool,
     pub extend_prefix: bool,
-    pub do_not_add_dns: bool,
     pub dns_list: Vec<String>,
 }
 
@@ -207,8 +206,7 @@ impl Default for Config {
                 ifname: "auto".to_string(),
                 ra_master: false,
                 extend_prefix: true,
-                do_not_add_dns: false,
-                dns_list: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
+                dns_list: vec![],
             },
             sys_log_config: SysLogConfig {
                 enable: true,
@@ -301,11 +299,19 @@ impl Config {
         config.at_config.serial.timeout = get_int("serial_timeout", 10);
 
         // Notification Config
-        let enabled_services_str = get_str("enabled_push_services", "");
-        config.notification_config.enabled_push_services = enabled_services_str
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let mut enabled_services = Vec::new();
+        if get_bool("enable_wechat", false) { enabled_services.push("wechat".to_string()); }
+        if get_bool("enable_pushplus", false) { enabled_services.push("pushplus".to_string()); }
+        if get_bool("enable_serverchan", false) { enabled_services.push("serverchan".to_string()); }
+        if get_bool("enable_pushdeer", false) { enabled_services.push("pushdeer".to_string()); }
+        if get_bool("enable_feishu", false) { enabled_services.push("feishu".to_string()); }
+        if get_bool("enable_dingtalk", false) { enabled_services.push("dingtalk".to_string()); }
+        if get_bool("enable_bark", false) { enabled_services.push("bark".to_string()); }
+        if get_bool("enable_telegram", false) { enabled_services.push("telegram".to_string()); }
+        if get_bool("enable_generic", false) { enabled_services.push("generic".to_string()); }
+        if get_bool("enable_custom", false) { enabled_services.push("custom".to_string()); }
+
+        config.notification_config.enabled_push_services = enabled_services;
 
         let wechat = get_str("wechat_webhook", "");
         config.notification_config.wechat_webhook = if wechat.is_empty() { None } else { Some(wechat) };
@@ -399,7 +405,6 @@ impl Config {
         config.advanced_network_config.ifname = get_str("ifname", "auto");
         config.advanced_network_config.ra_master = get_bool("ra_master", false);
         config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
-        config.advanced_network_config.do_not_add_dns = get_bool("do_not_add_dns", false);
         
         // Fetch dns_list separately as it's a list
         if let Ok(output) = Command::new("uci").args(&["get", "at-webserver.config.dns_list"]).output() {
