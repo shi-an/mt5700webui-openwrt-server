@@ -191,8 +191,9 @@ impl ATClientActor {
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
-        info!("Sending Command: {}", cmd);
-        conn.send(cmd.as_bytes()).await?;
+        let clean_cmd = cmd.trim();
+        info!("Sending Command: {}", clean_cmd);
+        conn.send(clean_cmd.as_bytes()).await?;
         conn.send(b"\r\n").await?;
 
         let start = std::time::Instant::now();
@@ -216,20 +217,25 @@ impl ATClientActor {
                     
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
+                        
+                        if Self::is_urc(handlers, &line) {
+                            Self::handle_urc(handlers, &line, notifications, cmd_tx).await;
+                            continue;
+                        }
+
+                        // Append non-URC lines exactly
+                        response_data.push_str(&line);
+                        response_data.push_str("\r\n");
+
                         if line == "OK" {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string())));
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
                              return Ok(());
                         } else if line.contains("ERROR") {
-                             let _ = reply_tx.send(ATResponse::error(format!("AT Error: {}", line)));
+                             let _ = reply_tx.send(ATResponse::error(response_data));
                              return Ok(());
                         } else if line.starts_with(">") {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string()))); 
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data))); 
                              return Ok(());
-                        } else if Self::is_urc(handlers, &line) {
-                            Self::handle_urc(handlers, &line, notifications, cmd_tx).await;
-                        } else {
-                            response_data.push_str(&line);
-                            response_data.push('\n');
                         }
                     }
                 },

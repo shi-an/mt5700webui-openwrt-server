@@ -227,22 +227,12 @@ async fn handle_client(
 
                                 match resp_rx.await {
                                     Ok(response) => {
-                                        // Filter out echoed command from response if present
-                                        let mut filtered_data = response.data.clone();
-                                        if let Some(data) = &filtered_data {
-                                            let clean_cmd = cmd_str.trim();
-                                            let lines: Vec<&str> = data.lines()
-                                                .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
-                                                .collect();
-                                            filtered_data = Some(lines.join("\r\n"));
-                                        }
-
+                                        // 绝对不要对 AT 结果做任何裁剪，原汁原味返回给前端
                                         let ws_resp = WSResponse {
                                             success: response.success,
-                                            data: filtered_data,
+                                            data: response.data,
                                             error: response.error,
                                         };
-
                                         let json_resp = serde_json::to_string(&ws_resp).unwrap();
                                         if let Err(e) = tx.send(warp::ws::Message::text(json_resp)).await {
                                             error!("Failed to send response to WS: {}", e);
