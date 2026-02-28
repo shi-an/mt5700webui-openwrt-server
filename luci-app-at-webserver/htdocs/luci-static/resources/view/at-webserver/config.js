@@ -13,6 +13,13 @@ var callServiceList = rpc.declare({
 	expect: { '': {} }
 });
 
+var callInitAction = rpc.declare({
+	object: 'luci',
+	method: 'setInitAction',
+	params: ['name', 'action'],
+	expect: { result: false }
+});
+
 function getServiceStatus() {
 	return L.resolveDefault(callServiceList('at-webserver'), {}).then(function(res) {
 		var isRunning = false;
@@ -445,6 +452,12 @@ return view.extend({
 		o.default = '1';
 
 		return m.render();
+	},
+
+	handleSaveApply: function(ev, mode) {
+		return this.super('handleSaveApply', [ev, mode]).then(function() {
+			return callInitAction('at-webserver', 'restart');
+		});
 	},
 
 	handleReset: null
