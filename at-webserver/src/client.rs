@@ -212,8 +212,8 @@ impl ATClientActor {
         conn: &mut Box<dyn ATConnection>,
         buffer: &mut Vec<u8>,
         handlers: &[Box<dyn MessageHandler>],
-        notifications: &NotificationManager,
-        cmd_tx: &CommandSender,
+        _notifications: &NotificationManager,
+        _cmd_tx: &CommandSender,
         urc_tx: &mpsc::Sender<String>,
         cmd: String,
         reply_tx: oneshot::Sender<ATResponse>
@@ -289,8 +289,8 @@ impl ATClientActor {
     async fn process_buffer_lines(
         buffer: &mut Vec<u8>,
         handlers: &[Box<dyn MessageHandler>],
-        notifications: &NotificationManager,
-        cmd_tx: &CommandSender,
+        _notifications: &NotificationManager,
+        _cmd_tx: &CommandSender,
         urc_tx: &mpsc::Sender<String>
     ) {
          while let Some(line) = extract_next_line(buffer) {
@@ -321,8 +321,11 @@ impl ATClientActor {
 
 fn extract_next_line(buffer: &mut Vec<u8>) -> Option<String> {
     if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-        let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
-        let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        // 直接使用切片读取，避免 collect 产生额外的 Vec<u8> 内存分配
+        let line = String::from_utf8_lossy(&buffer[..pos]).trim().to_string();
+        // 直接丢弃已读字节
+        buffer.drain(..=pos);
+        
         if line.is_empty() {
             return extract_next_line(buffer);
         }

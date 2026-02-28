@@ -238,7 +238,7 @@ impl NewSMSHandler {
                         "data": {
                             "sender": sms.sender,
                             "content": content,
-                            "time": sms.timestamp,
+                            "time": sms.date,
                             "isComplete": true
                         }
                     }).to_string();
@@ -257,7 +257,7 @@ impl NewSMSHandler {
                     "data": {
                         "sender": sms.sender,
                         "content": sms.content,
-                        "time": sms.timestamp,
+                        "time": sms.date,
                         "isComplete": true
                     }
                 }).to_string();

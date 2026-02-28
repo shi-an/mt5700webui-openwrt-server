@@ -121,6 +121,7 @@ pub struct AdvancedNetworkConfig {
     pub ra_master: bool,
     pub extend_prefix: bool,
     pub dns_list: Vec<String>,
+    pub init_at_cmds: Vec<String>,
 }
 
 impl Default for Config {
@@ -207,6 +208,7 @@ impl Default for Config {
                 ra_master: false,
                 extend_prefix: true,
                 dns_list: vec![],
+                init_at_cmds: vec![],
             },
             sys_log_config: SysLogConfig {
                 enable: true,
@@ -406,16 +408,22 @@ impl Config {
         config.advanced_network_config.ra_master = get_bool("ra_master", false);
         config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
         
-        // Fetch dns_list separately as it's a list
-        if let Ok(output) = Command::new("uci").args(&["get", "at-webserver.config.dns_list"]).output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let dns_list: Vec<String> = stdout.split_whitespace().map(|s| s.to_string()).collect();
-                if !dns_list.is_empty() {
-                    config.advanced_network_config.dns_list = dns_list;
-                }
+        // 解析列表类型的辅助函数
+        let get_list = |key: &str| -> Vec<String> {
+            match uci_data.get(key) {
+                Some(val) => val.split_whitespace()
+                                .map(|s| s.trim_matches('\'').trim_matches('"').to_string())
+                                .collect(),
+                None => Vec::new(),
             }
+        };
+
+        let parsed_dns = get_list("dns_list");
+        if !parsed_dns.is_empty() {
+            config.advanced_network_config.dns_list = parsed_dns;
         }
+
+        config.advanced_network_config.init_at_cmds = get_list("init_at_cmds");
 
         // SysLog Config
         config.sys_log_config.enable = get_bool("sys_log_enable", true);

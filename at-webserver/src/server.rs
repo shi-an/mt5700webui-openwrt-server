@@ -29,7 +29,7 @@ struct WSResponse {
 }
 
 pub async fn start_server(
-    ipv4_port: u16,
+    _ipv4_port: u16,
     ipv6_port: u16,
     auth_key: Option<String>,
     at_client: ATClient,
