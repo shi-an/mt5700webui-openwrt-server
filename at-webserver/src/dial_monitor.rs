@@ -136,34 +136,68 @@ async fn detect_modem_ifname(configured: &str) -> String {
         return configured.to_string();
     }
 
-    let mut found_ifnames = Vec::new();
-    if let Ok(mut entries) = fs::read_dir("/sys/class/net/").await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_name) = entry.file_name().into_string() {
-                // Filter out known local/bridge interfaces
-                if file_name == "lo" || file_name == "br-lan" || file_name == "eth0" {
-                    continue;
-                }
-                found_ifnames.push(file_name);
+    if let Some(iface) = detect_modem_interface().await {
+        return iface;
+    }
+    
+    // Fallback
+    "eth1".to_string()
+}
+
+/// 基于 QModem 原理的绝对精准探测法：直接读取 USB 设备的 Vendor ID (厂商代码)
+async fn detect_modem_interface() -> Option<String> {
+    let net_dir = "/sys/class/net";
+    let Ok(mut entries) = fs::read_dir(net_dir).await else { return None; };
+
+    // 5G/4G 模组的主流厂商 VID 列表 (提取自 QModem 数据库)
+    // 3466: Huawei MT5700
+    // 2c7c: Quectel
+    // 2cb7: Fibocom
+    // 12d1: Huawei
+    // 19d2: ZTE
+    // 05c6: Qualcomm Generic
+    let valid_vids = [
+        "3466", "2c7c", "2cb7", "12d1", "19d2", "05c6"
+    ];
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let iface = entry.file_name().into_string().unwrap_or_default();
+        // 初级过滤：排除系统内部回环、网桥和无线虚拟网卡
+        if iface == "lo" || iface.starts_with("br-") || iface.starts_with("wl") || iface.starts_with("ra") {
+            continue;
+        }
+
+        // 核心逻辑：读取该网卡对应的物理设备 Vendor ID
+        // 路径通常为 /sys/class/net/<iface>/device/idVendor 或 /sys/class/net/<iface>/device/../idVendor
+        // 注意：在 tokio fs 中 read_to_string 是异步的
+        let vendor_path_direct = format!("{}/{}/device/idVendor", net_dir, iface);
+        let vendor_path_parent = format!("{}/{}/device/../idVendor", net_dir, iface);
+        
+        let mut vid = match fs::read_to_string(&vendor_path_direct).await {
+            Ok(v) => v,
+            Err(_) => "".to_string()
+        };
+
+        if vid.trim().is_empty() {
+             match fs::read_to_string(&vendor_path_parent).await {
+                Ok(v) => vid = v,
+                Err(_) => {}
+             }
+        }
+        
+        let vid = vid.trim().to_lowercase();
+        if !vid.is_empty() {
+            // 如果读取到的厂商 ID 在我们的 5G 模块白名单中
+            if valid_vids.contains(&vid.as_str()) {
+                info!(
+                    "Hardware probing success! Found 5G modem: {} (Vendor ID: {})",
+                    iface, vid
+                );
+                return Some(iface);
             }
         }
     }
 
-    // Priority 1: usb*
-    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("usb")) {
-        return name.clone();
-    }
-
-    // Priority 2: wwan*
-    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("wwan")) {
-        return name.clone();
-    }
-
-    // Priority 3: eth* (excluding eth0 which is already filtered)
-    if let Some(name) = found_ifnames.iter().find(|n| n.starts_with("eth")) {
-        return name.clone();
-    }
-
-    // Fallback
-    "eth1".to_string()
+    warn!("No valid 5G/4G USB modem interface found based on Vendor ID.");
+    None
 }
