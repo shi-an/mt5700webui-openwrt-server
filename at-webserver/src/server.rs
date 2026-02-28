@@ -7,6 +7,9 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, broadcast};
 use tokio::time::{timeout, Duration};
 use warp::Filter;
+use std::sync::OnceLock;
+
+pub static WS_BROADCASTER: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct WSCommand {
@@ -33,6 +36,9 @@ pub async fn start_server(
     log_rx: broadcast::Receiver<String>,
     log_path: String,
 ) {
+    let (ws_tx, _) = broadcast::channel(100);
+    let _ = WS_BROADCASTER.set(ws_tx.clone());
+
     let at_client = Arc::new(at_client);
     let auth_key = Arc::new(auth_key);
     let log_rx = Arc::new(log_rx);
@@ -120,6 +126,7 @@ async fn handle_client(
     let (mut tx, mut rx) = ws.split();
     let sender = at_client.get_sender();
     let mut log_rx = log_rx.resubscribe();
+    let mut ws_raw_rx = WS_BROADCASTER.get().unwrap().subscribe();
 
     // Start heartbeat loop (optional, but good for keepalive)
     // For warp/tungstenite, ping/pong is handled automatically at protocol level usually,
@@ -137,6 +144,13 @@ async fn handle_client(
                  if let Err(e) = tx.send(warp::ws::Message::text(msg)).await {
                      // If client disconnected, we might get error here
                      debug!("Failed to send log to WS: {}", e);
+                     break;
+                 }
+            }
+            // Handle global broadcast events (raw_data, new_sms, etc.)
+            Ok(broadcast_msg) = ws_raw_rx.recv() => {
+                 if let Err(e) = tx.send(warp::ws::Message::text(broadcast_msg)).await {
+                     debug!("Failed to send broadcast to WS: {}", e);
                      break;
                  }
             }

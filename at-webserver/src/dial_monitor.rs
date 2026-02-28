@@ -23,6 +23,11 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         info!("IP address detected. Marking as connected.");
                         is_connected = true;
                         
+                        info!("Initializing modem URC reporting configs...");
+                        let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
+                        let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
+                        let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
+
                         // Detect interface
                         let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
                         info!("Auto-detected 5G interface: {}", actual_ifname);

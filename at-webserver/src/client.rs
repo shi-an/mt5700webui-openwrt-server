@@ -246,6 +246,14 @@ impl ATClientActor {
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
                         
+                        if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                            let ws_msg = serde_json::json!({
+                                "type": "raw_data",
+                                "data": line.clone()
+                            }).to_string();
+                            let _ = tx.send(ws_msg);
+                        }
+
                         // 遇到 URC，推送到后台队列处理，主 Actor 继续畅通无阻
                         if Self::is_urc(handlers, &line) {
                             let _ = urc_tx.send(line).await;
@@ -287,6 +295,16 @@ impl ATClientActor {
     ) {
          while let Some(line) = extract_next_line(buffer) {
              debug!("URC/Idle: {}", line);
+             
+             // 广播所有原始数据给 Vue 前端，用于驱动信号图表和 AT 终端
+             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                 let ws_msg = serde_json::json!({
+                     "type": "raw_data",
+                     "data": line.clone()
+                 }).to_string();
+                 let _ = tx.send(ws_msg);
+             }
+
              if Self::is_urc(handlers, &line) {
                  let _ = urc_tx.send(line).await;
              }

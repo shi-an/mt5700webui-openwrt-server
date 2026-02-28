@@ -46,6 +46,17 @@ impl MessageHandler for CallHandler {
             notifications
                 .notify("System", "Incoming Call (Ring)", NotificationType::Call)
                 .await;
+            
+            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                let msg = serde_json::json!({
+                    "type": "incoming_call",
+                    "data": {
+                        "number": "Unknown",
+                        "status": "RING"
+                    }
+                }).to_string();
+                let _ = tx.send(msg);
+            }
         } else if line.contains("+CLIP:") {
             let re = RE_CLIP.get_or_init(|| Regex::new(r#"\+CLIP: "([^"]+)""#).unwrap());
             if let Some(caps) = re.captures(line) {
@@ -53,6 +64,17 @@ impl MessageHandler for CallHandler {
                     notifications
                         .notify(number.as_str(), "Incoming Call", NotificationType::Call)
                         .await;
+                    
+                    if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                        let msg = serde_json::json!({
+                            "type": "incoming_call",
+                            "data": {
+                                "number": number.as_str(),
+                                "status": "CLIP"
+                            }
+                        }).to_string();
+                        let _ = tx.send(msg);
+                    }
                 }
             }
         }
@@ -209,12 +231,38 @@ impl NewSMSHandler {
                 }
                 info!("Combined partial SMS from {}", sms.sender);
                 notifications.notify(&sms.sender, &content, NotificationType::SMS).await;
+                
+                if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                    let msg = serde_json::json!({
+                        "type": "new_sms",
+                        "data": {
+                            "sender": sms.sender,
+                            "content": content,
+                            "time": sms.timestamp,
+                            "isComplete": true
+                        }
+                    }).to_string();
+                    let _ = tx.send(msg);
+                }
             } else {
                 info!("Received part {}/{} from {}", partial.part_number, partial.parts_count, sms.sender);
             }
         } else {
             // Normal SMS
             notifications.notify(&sms.sender, &sms.content, NotificationType::SMS).await;
+            
+            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                let msg = serde_json::json!({
+                    "type": "new_sms",
+                    "data": {
+                        "sender": sms.sender,
+                        "content": sms.content,
+                        "time": sms.timestamp,
+                        "isComplete": true
+                    }
+                }).to_string();
+                let _ = tx.send(msg);
+            }
         }
     }
 }
@@ -257,11 +305,11 @@ impl MessageHandler for PDCPDataHandler {
                         }
                     });
                     
-                    // Broadcast via WebSocket (need access to WS server, but handlers are decoupled)
-                    // Currently we can't easily broadcast without a reference to WS server or a bus.
-                    // For now, we'll log it, assuming integration will be added later or via notification bus.
+                    // Broadcast via WebSocket
                     debug!("PDCP Data: {}", data);
-                    // TODO: Implement WebSocket broadcast mechanism
+                    if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                        let _ = tx.send(data.to_string());
+                    }
                 }
             }
         }
