@@ -202,10 +202,6 @@ start_service() {
 	
 	setup_firewall
 	
-	# 确保没有旧进程在运行
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	sleep 1
-	
 	logger -t at-webserver "配置 procd 实例..."
 	echo "Starting AT WebServer..."
 	
@@ -225,12 +221,6 @@ start_service() {
 stop_service() {
 	logger -t at-webserver "停止服务..."
 	echo "Stopping AT WebServer..."
-	
-	# 强制杀死所有相关进程
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	
-	# 清理 pidfile
-	rm -f /var/run/at-webserver.pid
 	
 	# 清理防火墙规则
 	# 清理 WebSocket WAN 阻止规则
@@ -275,26 +265,6 @@ stop_service() {
 	sleep 1
 	logger -t at-webserver "服务已停止"
 	echo "AT WebServer stopped"
-}
-
-reload_service() {
-	logger -t at-webserver "重新加载配置..."
-	echo "Reloading AT WebServer configuration..."
-	
-	# 提交最新配置
-	uci -q commit at-webserver
-	
-	# 强制停止所有相关进程
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	rm -f /var/run/at-webserver.pid
-	
-	# 等待进程完全停止
-	sleep 3
-	
-	# 重新启动服务
-	start_service
-	
-	logger -t at-webserver "配置重新加载完成"
 }
 
 service_triggers() {

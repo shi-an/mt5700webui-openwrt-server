@@ -13,13 +13,6 @@ var callServiceList = rpc.declare({
 	expect: { '': {} }
 });
 
-var callInitAction = rpc.declare({
-	object: 'luci',
-	method: 'setInitAction',
-	params: ['name', 'action'],
-	expect: { result: false }
-});
-
 function getServiceStatus() {
 	return L.resolveDefault(callServiceList('at-webserver'), {}).then(function(res) {
 		var isRunning = false;
@@ -452,63 +445,6 @@ return view.extend({
 		o.default = '1';
 
 		return m.render();
-	},
-
-	handleSaveApply: function(ev, mode) {
-		return this.handleSave(ev).then(L.bind(function() {
-			// 等待一下确保 UCI 已提交
-			return new Promise(function(resolve) {
-				setTimeout(resolve, 500);
-			}).then(L.bind(function() {
-				return this.handleRestart(ev);
-			}, this));
-		}, this));
-	},
-
-	handleSave: function(ev) {
-		// 直接调用父类 handleSave，让 LuCI 处理所有数据绑定和保存
-		return this.super('handleSave', [ev]).then(function() {
-			ui.addNotification(null, E('p', _('✓ 配置已保存')), 'success');
-		}).catch(function(e) {
-			ui.addNotification(null, E('p', _('保存配置失败: ') + (e.message || e)), 'error');
-			throw e;
-		});
-	},
-
-	handleRestart: function(ev) {
-		ui.showModal(_('正在应用配置'), [
-			E('p', { 'class': 'spinning' }, _('正在应用配置并重启服务...'))
-		]);
-
-		// 重新加载 UCI 以获取最新的 enabled 状态
-		return uci.load('at-webserver').then(function() {
-			var enabled = uci.get('at-webserver', 'config', 'enabled');
-			
-			if (enabled === '1') {
-				// 启用并重启
-				return callInitAction('at-webserver', 'enable').then(function() {
-					return callInitAction('at-webserver', 'restart');
-				});
-			} else {
-				// 停止并禁用
-				return callInitAction('at-webserver', 'stop').then(function() {
-					return callInitAction('at-webserver', 'disable');
-				});
-			}
-		}).then(function() {
-			return new Promise(function(resolve) { 
-				setTimeout(resolve, 3000); 
-			});
-		}).then(function() {
-			ui.hideModal();
-			ui.addNotification(null, E('p', _('✓ 服务配置已应用')), 'success');
-			setTimeout(function() { 
-				window.location.reload(true); 
-			}, 1000);
-		}).catch(function(e) {
-			ui.hideModal();
-			ui.addNotification(null, E('p', _('应用配置失败: ') + (e.message || e)), 'error');
-		});
 	},
 
 	handleReset: null
