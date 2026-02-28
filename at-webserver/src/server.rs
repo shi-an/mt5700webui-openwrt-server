@@ -53,17 +53,8 @@ pub async fn start_server(
             ws.on_upgrade(move |socket| handle_client(socket, client, key, rx, path))
         });
 
-    // Start IPv4 server
-    let routes_v4 = routes.clone();
-    let server_v4 = warp::serve(routes_v4).run(([0, 0, 0, 0], ipv4_port));
-
-    // Start IPv6 server
-    let server_v6 = warp::serve(routes).run(([0, 0, 0, 0, 0, 0, 0, 0], ipv6_port));
-
-    info!("Starting WebSocket server on IPv4 0.0.0.0:{} and IPv6 [::]:{}", ipv4_port, ipv6_port);
-    
-    // Run both servers concurrently
-    tokio::join!(server_v4, server_v6);
+    info!("Starting WebSocket server on [::]:{} (Dual-stack IPv4 & IPv6)", ipv6_port);
+    warp::serve(routes).run(([0, 0, 0, 0, 0, 0, 0, 0], ipv6_port)).await;
 }
 
 async fn handle_client(
