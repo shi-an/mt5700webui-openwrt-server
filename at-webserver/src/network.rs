@@ -85,6 +85,22 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         }
     }
 
+    // 动态寻找 wan 防火墙区域并将 wan_modem/wan_modem6 注入其中
+    info!("Binding modem interfaces to firewall wan zone...");
+    let fw_script = r#"
+        WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
+        if [ -n "$WAN_ZONE" ]; then
+            uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
+            uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
+            uci add_list firewall.$WAN_ZONE.network='wan_modem'
+            uci add_list firewall.$WAN_ZONE.network='wan_modem6'
+            uci commit firewall
+        fi
+    "#;
+    if let Err(e) = run_command("sh", &["-c", fw_script]).await {
+        error!("Failed to inject firewall rules: {}", e);
+    }
+
     // Firewall reload is usually safe and non-disruptive
     if let Err(_) = run_command("/etc/init.d/firewall", &["reload"]).await {
         warn!("Failed to reload firewall via init.d, trying fw4...");

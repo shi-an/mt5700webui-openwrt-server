@@ -59,7 +59,8 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
 }
 
 async fn check_ip_status(at_client: &ATClient) -> Result<bool> {
-    let response = at_client.send_command("AT+CGPADDR=1".to_string()).await?;
+    // Query all PDP contexts to support modules that use index 0, 1, or 3
+    let response = at_client.send_command("AT+CGPADDR".to_string()).await?;
     
     // Response format example: +CGPADDR: 1,"10.11.12.13" or +CGPADDR: 1,""
     if let Some(content) = response.data {
@@ -115,18 +116,11 @@ async fn perform_dial(config: &Config, at_client: &ATClient) -> Result<()> {
     };
     
     let apn_cmd = format!("AT+CGDCONT=1,\"{}\",\"auto\"", at_pdp_type);
-    at_client.send_command(apn_cmd).await?;
-    
-    // 2. Dial
-    // Try QNETDEVCTL (Quectel)
-    // AT+QNETDEVCTL=1,1,1 (Context 1, Enable 1, Protocol 1?) - Protocol 1 is usually ECM/QMI? 
-    // Actually the command usually is AT+QNETDEVCTL=1,1,1
-    // We'll try it.
+    let _ = at_client.send_command(apn_cmd).await;
     let _ = at_client.send_command("AT+QNETDEVCTL=1,1,1".to_string()).await;
-    
-    // Try CGACT (Standard)
-    // AT+CGACT=1,1
     let _ = at_client.send_command("AT+CGACT=1,1".to_string()).await;
+    // Fallback for Fibocom FM350 and others using PDP 0
+    let _ = at_client.send_command("AT+CGACT=1,0".to_string()).await;
     
     Ok(())
 }
@@ -140,8 +134,8 @@ async fn detect_modem_ifname(configured: &str) -> String {
         return iface;
     }
     
-    // Fallback
-    "eth1".to_string()
+    // Fallback to a typical USB modem interface, NEVER eth0/eth1
+    "usb0".to_string()
 }
 
 /// 基于 QModem 原理的绝对精准探测法：直接读取 USB 设备的 Vendor ID (厂商代码)
