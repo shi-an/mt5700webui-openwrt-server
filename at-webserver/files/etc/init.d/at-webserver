@@ -219,21 +219,23 @@ start_service() {
 }
 
 stop_service() {
-    # 1. 停止网络接口
+    # 1. 断开网络接口
     ifdown wan_modem 2>/dev/null
     ifdown wan_modem6 2>/dev/null
-    # 2. 删除 UCI 配置
+    
+    # 2. 从网络配置中彻底删除
     uci -q delete network.wan_modem
     uci -q delete network.wan_modem6
     uci commit network
-    # 3. 从防火墙剥离
-    WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
-    [ -n "$WAN_ZONE" ] && {
+    
+    # 3. 从防火墙 wan 区域中极其精准地剥离
+    WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
+    if [ -n "$WAN_ZONE" ]; then
         uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
         uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
         uci commit firewall
         fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
-    }
+    fi
 }
 
 service_triggers() {

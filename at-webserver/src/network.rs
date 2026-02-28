@@ -3,8 +3,9 @@ use anyhow::Result;
 use log::{error, info};
 use tokio::process::Command;
 
-pub async fn setup_modem_network(_config: &Config, ifname: &str) -> Result<()> {
+pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     info!("Configuring modem network for interface: {}", ifname);
+    let pdp_type = &config.advanced_network_config.pdp_type;
     
     let uci_script = format!(r#"
         # 1. 清理旧配置
@@ -26,10 +27,6 @@ pub async fn setup_modem_network(_config: &Config, ifname: &str) -> Result<()> {
         
         # 4. 提交配置落盘
         uci commit network
-        
-        # 5. 精确拉起 5G 接口 (不影响本地 LAN/WiFi)
-        ifup wan_modem
-        ifup wan_modem6
     "#, ifname);
 
     info!("Executing UCI script for network setup...");
@@ -49,20 +46,29 @@ pub async fn setup_modem_network(_config: &Config, ifname: &str) -> Result<()> {
         return Err(anyhow::anyhow!("UCI script failed: {}", stderr));
     }
 
-    // 精准绑定到防火墙 wan 区域并重载
+    info!("Binding modem interfaces to firewall wan zone...");
     let fw_script = r#"
-        WAN_ZONE=$(uci show firewall | grep "=zone" | grep -B 1 "name='wan'" | cut -d'.' -f2 | head -n 1)
+        WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
         if [ -n "$WAN_ZONE" ]; then
             uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
             uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
             uci add_list firewall.$WAN_ZONE.network='wan_modem'
             uci add_list firewall.$WAN_ZONE.network='wan_modem6'
             uci commit firewall
-            /etc/init.d/firewall reload 2>/dev/null || fw4 reload 2>/dev/null
         fi
         exit 0
     "#;
     let _ = run_command("sh", &["-c", fw_script]).await;
+
+    info!("Bringing up interfaces and reloading firewall...");
+    let _ = run_command("ifup", &["wan_modem"]).await;
+    if pdp_type.contains("ipv6") {
+        let _ = run_command("ifup", &["wan_modem6"]).await;
+    }
+    
+    // 统一由 OpenWrt 的 fw4 / firewall 接管重载
+    let _ = run_command("fw4", &["reload"]).await;
+    let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
     
     info!("Network configuration completed.");
     Ok(())
@@ -83,6 +89,31 @@ async fn run_command(program: &str, args: &[&str]) -> Result<()> {
         error!("Command {} {:?} failed: {}", program, args, stderr);
         return Err(anyhow::anyhow!("Command failed"));
     }
+    Ok(())
+}
+
+pub async fn teardown_modem_network() -> Result<()> {
+    info!("Tearing down modem network by frontend request...");
+    // 1. 断开网口
+    let _ = run_command("ifdown", &["wan_modem"]).await;
+    let _ = run_command("ifdown", &["wan_modem6"]).await;
+
+    // 2. 清理 OpenWrt 配置与防火墙
+    let teardown_script = r#"
+        uci -q delete network.wan_modem
+        uci -q delete network.wan_modem6
+        uci commit network
+        WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
+        if [ -n "$WAN_ZONE" ]; then
+            uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
+            uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
+            uci commit firewall
+            fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+        fi
+        exit 0
+    "#;
+    let _ = run_command("sh", &["-c", teardown_script]).await;
+    info!("Network interfaces and firewall rules cleared.");
     Ok(())
 }
 
