@@ -32,7 +32,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     if pdp_type.contains("ipv6") || pdp_type.contains("ipv4v6") {
         uci_batch.push_str("set network.wan_modem6=interface\n");
         uci_batch.push_str("set network.wan_modem6.proto=dhcpv6\n");
-        uci_batch.push_str("set network.wan_modem6.device='@wan_modem'\n"); // 别名挂载
+        uci_batch.push_str(&format!("set network.wan_modem6.device='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
         uci_batch.push_str("set network.wan_modem6.reqprefix=auto\n");
         uci_batch.push_str("set network.wan_modem6.reqaddress=try\n");
