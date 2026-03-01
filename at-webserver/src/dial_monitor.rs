@@ -64,39 +64,50 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
 }
 
 async fn check_ip_status(at_client: &ATClient) -> Result<bool> {
-    // Query all PDP contexts to support modules that use index 0, 1, or 3
     let response = at_client.send_command("AT+CGPADDR".to_string()).await?;
     
-    // Response format example: +CGPADDR: 1,"10.11.12.13" or +CGPADDR: 1,""
     if let Some(content) = response.data {
         debug!("IP Check Response: {}", content);
-        // Simple check: look for a digit or non-empty string inside quotes that isn't 0.0.0.0
-        // But some modems return 0.0.0.0 when not connected.
-        // And we need to ignore empty strings "".
         
-        // Split by lines in case of multiple lines
         for line in content.lines() {
-            if line.contains("+CGPADDR:") {
-                // Check if we have a valid IP. 
-                // A quick heuristic: check if there's a number.
-                // Or better, parse the IPs.
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 2 {
-                    // parts[1] should be the first IP
-                    let ip1 = parts[1].trim().trim_matches('"');
-                    if !ip1.is_empty() && ip1 != "0.0.0.0" {
-                        info!("Detected IP: {}", ip1);
-                        return Ok(true);
+            let line = line.trim();
+            if line.starts_with("+CGPADDR:") {
+                // 提取冒号后面的内容，例如: 1,"10.52.0.113","2409:8a00::1"
+                let parts: Vec<&str> = line.splitn(2, ':').collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+                
+                let data_part = parts[1].trim();
+                // 按逗号分割，注意可能只有 IPV4，也可能有 IPV6
+                let segments: Vec<&str> = data_part.split(',').collect();
+                
+                let mut found_valid_ip = false;
+                
+                // segments[0] 通常是 PDP 索引，跳过。从 segments[1] 开始是 IP
+                for (_i, segment) in segments.iter().enumerate().skip(1) {
+                    // 去除可能存在的引号和多余空格
+                    let clean_ip = segment.trim_matches(|c| c == '"' || c == ' ' || c == '\r' || c == '\n');
+                    
+                    // 过滤掉无效 IP 和空字符串
+                    if clean_ip.is_empty() || clean_ip == "0.0.0.0" || clean_ip == "::" {
+                        continue;
                     }
                     
-                    // Check second IP if exists (IPv6)
-                    if parts.len() >= 3 {
-                        let ip2 = parts[2].trim().trim_matches('"');
-                        if !ip2.is_empty() && ip2 != "0.0.0.0" && ip2 != "::" {
-                            info!("Detected IPv6: {}", ip2);
-                            return Ok(true);
-                        }
+                    // 严谨校验：如果是 IPv4，它必须包含点（.）且不能太长
+                    if clean_ip.contains('.') && clean_ip.len() <= 15 {
+                        info!("Detected IPv4: {}", clean_ip);
+                        found_valid_ip = true;
                     }
+                    // 严谨校验：如果是 IPv6，它必须包含冒号（:）
+                    else if clean_ip.contains(':') && clean_ip.len() <= 39 {
+                        info!("Detected IPv6: {}", clean_ip);
+                        found_valid_ip = true;
+                    }
+                }
+                
+                if found_valid_ip {
+                    return Ok(true);
                 }
             }
         }
