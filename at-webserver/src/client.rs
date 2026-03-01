@@ -219,10 +219,23 @@ impl ATClientActor {
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
-        // 【核心硬件保护锁】：限制 AT 指令并发下发速率（对标 Python 版的 0.1s 间隔）
-        // 强制让当前协程等待 100 毫秒，确保模块有足够的时间完整消化并输出上一条指令的数据
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 1. 发射前清膛：抽干底层 OS 缓存，防止上一条高频指令遗留的 OK 破坏本次解析
+        let mut buf = [0u8; 1024];
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(5), conn.receive(&mut buf)).await {
+            if n == 0 { break; }
+            buffer.extend_from_slice(&buf[..n]);
+        }
         
+        // 把抽出来的残余数据当作空闲状态处理掉
+        while let Some(line) = extract_next_line(buffer) {
+            let _ = urc_tx.send(line.clone()).await;
+            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                let _ = tx.send(serde_json::json!({"type": "raw_data", "data": line}).to_string());
+            }
+        }
+
+        // 2. 硬件保护：强制限制 AT 指令并发速率（模块串口处理需要时间）
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let clean_cmd = cmd.trim();
         info!("Sending Command: {}", clean_cmd);
         conn.send(clean_cmd.as_bytes()).await?;
@@ -231,8 +244,7 @@ impl ATClientActor {
         let start = std::time::Instant::now();
         let timeout_dur = Duration::from_secs(10);
         let mut response_data = String::new();
-        let mut buf = [0u8; 1024];
-
+        
         loop {
             if start.elapsed() > timeout_dur {
                 let _ = reply_tx.send(ATResponse::error("Timeout".to_string()));
@@ -250,20 +262,19 @@ impl ATClientActor {
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
                         
-                        if let Some(tx) = crate::server::WS_BROADCASTER.get() {
-                            let ws_msg = serde_json::json!({
-                                "type": "raw_data",
-                                "data": line.clone()
-                            }).to_string();
-                            let _ = tx.send(ws_msg);
-                        }
-
-                        // 遇到 URC，推送到后台队列处理，主 Actor 继续畅通无阻
+                        // 3. 【切断死循环核心】：如果是 URC（主动通知），才广播 raw_data
                         if Self::is_urc(handlers, &line) {
-                            let _ = urc_tx.send(line).await;
+                            let _ = urc_tx.send(line.clone()).await;
+                            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                                let ws_msg = serde_json::json!({
+                                    "type": "raw_data",
+                                    "data": line
+                                }).to_string();
+                                let _ = tx.send(ws_msg);
+                            }
                             continue;
                         }
-                        // 严格保留 OK 和 ERROR，供 Vue 前端正则匹配
+                        // 绝不能在这里盲目广播 raw_data，正常的响应只存入 response_data
                         if line == "OK" {
                              response_data.push_str("OK");
                              let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
@@ -286,9 +297,7 @@ impl ATClientActor {
                      let _ = reply_tx.send(ATResponse::error(e.to_string()));
                      return Err(e);
                 },
-                Err(_) => {
-                    // Timeout per read
-                }
+                Err(_) => {}
             }
         }
     }
