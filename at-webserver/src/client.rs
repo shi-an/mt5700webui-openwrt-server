@@ -219,14 +219,12 @@ impl ATClientActor {
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
-        // 1. 发射前清膛：抽干底层 OS 缓存，防止上一条高频指令遗留的 OK 破坏本次解析
+        // 1. 发射前清膛：抽干底层缓存，处理掉堆积的真实闲置 URC
         let mut buf = [0u8; 1024];
         while let Ok(Ok(n)) = timeout(Duration::from_millis(5), conn.receive(&mut buf)).await {
             if n == 0 { break; }
             buffer.extend_from_slice(&buf[..n]);
         }
-        
-        // 把抽出来的残余数据当作空闲状态处理掉
         while let Some(line) = extract_next_line(buffer) {
             let _ = urc_tx.send(line.clone()).await;
             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
@@ -234,23 +232,28 @@ impl ATClientActor {
             }
         }
 
-        // 2. 硬件保护：强制限制 AT 指令并发速率（模块串口处理需要时间）
+        // 2. 硬件保护：强制限制 AT 指令并发速率，防止模块宕机
         tokio::time::sleep(Duration::from_millis(100)).await;
         let clean_cmd = cmd.trim();
         info!("Sending Command: {}", clean_cmd);
+        // 【核心修复】：智能提取当前查询的期望前缀 (例如 "AT^HCSQ?" 提取出 "^HCSQ")
+        let expected_prefix = if clean_cmd.starts_with("AT") {
+            let core = &clean_cmd[2..];
+            let end = core.find(|c: char| c == '?' || c == '=').unwrap_or(core.len());
+            &core[..end]
+        } else {
+            ""
+        };
         conn.send(clean_cmd.as_bytes()).await?;
         conn.send(b"\r\n").await?;
-
         let start = std::time::Instant::now();
         let timeout_dur = Duration::from_secs(10);
         let mut response_data = String::new();
-        
         loop {
             if start.elapsed() > timeout_dur {
                 let _ = reply_tx.send(ATResponse::error("Timeout".to_string()));
                 return Ok(());
             }
-
             match timeout(Duration::from_secs(1), conn.receive(&mut buf)).await {
                 Ok(Ok(n)) => {
                     if n == 0 { 
@@ -262,8 +265,14 @@ impl ATClientActor {
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
                         
-                        // 3. 【切断死循环核心】：如果是 URC（主动通知），才广播 raw_data
-                        if Self::is_urc(handlers, &line) {
+                        // 校验这行数据是不是针对我们当前命令的直接回答
+                        let mut is_my_response = false;
+                        if !expected_prefix.is_empty() && line.starts_with(expected_prefix) {
+                            is_my_response = true;
+                        }
+                        
+                        // 3. 【切断死循环】：如果它匹配 URC 且 "不是我们主动问的"，才判定为真实的自发变动
+                        if Self::is_urc(handlers, &line) && !is_my_response {
                             let _ = urc_tx.send(line.clone()).await;
                             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
                                 let ws_msg = serde_json::json!({
@@ -272,9 +281,9 @@ impl ATClientActor {
                                 }).to_string();
                                 let _ = tx.send(ws_msg);
                             }
-                            continue;
+                            continue; // 直接跳过，不放入 response_data
                         }
-                        // 绝不能在这里盲目广播 raw_data，正常的响应只存入 response_data
+                        // 正常的查询结果，稳稳妥妥地放进回应包里返回给前端
                         if line == "OK" {
                              response_data.push_str("OK");
                              let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
