@@ -219,6 +219,10 @@ impl ATClientActor {
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
+        // 【核心硬件保护锁】：限制 AT 指令并发下发速率（对标 Python 版的 0.1s 间隔）
+        // 强制让当前协程等待 100 毫秒，确保模块有足够的时间完整消化并输出上一条指令的数据
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        
         let clean_cmd = cmd.trim();
         info!("Sending Command: {}", clean_cmd);
         conn.send(clean_cmd.as_bytes()).await?;
