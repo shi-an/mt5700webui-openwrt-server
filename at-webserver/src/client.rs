@@ -259,19 +259,22 @@ impl ATClientActor {
                             let _ = urc_tx.send(line).await;
                             continue;
                         }
-                        // 恢复 Vue 依赖的格式：绝不将 OK 放入 payload，直接 trim！
+                        // 严格保留 OK 和 ERROR，供 Vue 前端正则匹配
                         if line == "OK" {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string())));
+                             response_data.push_str("OK");
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
                              return Ok(());
                         } else if line.contains("ERROR") {
-                             let _ = reply_tx.send(ATResponse::error(format!("AT Error: {}", line)));
+                             response_data.push_str(&line);
+                             let _ = reply_tx.send(ATResponse::error(response_data));
                              return Ok(());
                         } else if line.starts_with(">") {
-                             let _ = reply_tx.send(ATResponse::ok(Some(response_data.trim().to_string()))); 
+                             response_data.push_str(&line);
+                             let _ = reply_tx.send(ATResponse::ok(Some(response_data))); 
                              return Ok(());
                         } else {
                              response_data.push_str(&line);
-                             response_data.push('\n');
+                             response_data.push_str("\r\n");
                         }
                     }
                 },

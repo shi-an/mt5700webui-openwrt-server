@@ -135,18 +135,6 @@ async fn handle_client(
 
     loop {
         tokio::select! {
-            // Handle log messages
-            Ok(log_msg) = log_rx.recv() => {
-                 let msg = json!({
-                     "type": "system_log",
-                     "data": log_msg
-                 }).to_string();
-                 if let Err(e) = tx.send(warp::ws::Message::text(msg)).await {
-                     // If client disconnected, we might get error here
-                     debug!("Failed to send log to WS: {}", e);
-                     break;
-                 }
-            }
             // Handle global broadcast events (raw_data, new_sms, etc.)
             Ok(broadcast_msg) = ws_raw_rx.recv() => {
                  if let Err(e) = tx.send(warp::ws::Message::text(broadcast_msg)).await {
@@ -248,7 +236,7 @@ async fn handle_client(
                                             let lines: Vec<&str> = data.lines()
                                                 .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
                                                 .collect();
-                                            filtered_data = Some(lines.join("\n"));
+                                            filtered_data = Some(lines.join("\r\n"));
                                         }
                                         let ws_resp = WSResponse {
                                             success: response.success,
