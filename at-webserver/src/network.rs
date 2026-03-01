@@ -13,29 +13,36 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     uci_batch.push_str("delete network.wan_modem\n");
     uci_batch.push_str("delete network.wan_modem6\n");
 
-    if pdp_type.contains("ipv4") || pdp_type.contains("ipv4v6") {
+    if pdp_type.contains("ipv4") {
         uci_batch.push_str("set network.wan_modem=interface\n");
-        uci_batch.push_str("set network.wan_modem.proto=dhcp\n");
+        uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
         uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem.metric='10'\n");
         
         if !net_config.dns_list.is_empty() {
-            uci_batch.push_str("set network.wan_modem.peerdns=0\n");
+            uci_batch.push_str("set network.wan_modem.peerdns='0'\n");
             for dns in &net_config.dns_list {
                 uci_batch.push_str(&format!("add_list network.wan_modem.dns='{}'\n", dns));
             }
         } else {
-            uci_batch.push_str("set network.wan_modem.peerdns=1\n");
+            uci_batch.push_str("set network.wan_modem.peerdns='1'\n");
         }
     }
 
-    if pdp_type.contains("ipv6") || pdp_type.contains("ipv4v6") {
+    if pdp_type.contains("ipv6") {
         uci_batch.push_str("set network.wan_modem6=interface\n");
-        uci_batch.push_str("set network.wan_modem6.proto=dhcpv6\n");
-        uci_batch.push_str(&format!("set network.wan_modem6.device='{}'\n", ifname));
+        uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
+        uci_batch.push_str("set network.wan_modem6.device='@wan_modem'\n");
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
-        uci_batch.push_str("set network.wan_modem6.reqprefix=auto\n");
-        uci_batch.push_str("set network.wan_modem6.reqaddress=try\n");
+        
+        // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
+        uci_batch.push_str("set network.wan_modem6.reqaddress='force'\n");
+        uci_batch.push_str("set network.wan_modem6.reqprefix='auto'\n");
+        
+        // 【核心修复3】：要求强制将获取到的 5G 前缀扩展委派给内网 (LAN)
+        uci_batch.push_str("set network.wan_modem6.extendprefix='1'\n");
+        uci_batch.push_str("set network.wan_modem6.defaultroute='1'\n");
+        uci_batch.push_str("set network.wan_modem6.peerdns='1'\n");
     }
 
     uci_batch.push_str("commit network\n");
