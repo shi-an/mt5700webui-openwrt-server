@@ -213,27 +213,30 @@ impl ATClientActor {
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
-        // 1. 发射前清膛：抽干底层缓存，彻底丢弃上一条指令可能因为拥堵残留的脏数据 (防止串线)
+        // 1. 先休眠：给模块 100ms 喘息时间，同时让上一条指令迟到的尾巴(如 OK)落入操作系统的接收缓存
+        sleep(Duration::from_millis(100)).await;
+
+        // 2. 发射前清膛：此时休眠已结束，极其残忍地抽干缓存里的所有滞留数据
         let mut buf = [0u8; 1024];
         while let Ok(Ok(n)) = timeout(Duration::from_millis(10), conn.receive(&mut buf)).await {
             if n == 0 { break; }
             buffer.extend_from_slice(&buf[..n]);
         }
+        
+        // 悄悄处理掉滞留数据里可能混杂的有用 URC（如短信），但绝不触发网页全局刷新
         while let Some(line) = extract_next_line(buffer) {
-            // 滞留的数据中如果混有短信等重要 URC，悄悄处理，但绝不作为 raw_data 全局广播
             if Self::is_urc(handlers, &line) {
                 let _ = urc_tx.send(line).await;
-            } else {
-                debug!("Dropped stray buffer data before send: {}", line);
             }
         }
+        
+        // 【终极防粘包杀招】：如果 buffer 里还有没换行的半截孤儿字符（比如单独的 'O' 或 '\r'），直接抹杀！
+        buffer.clear();
 
-        // 2. 硬件保护：强制限制 AT 指令并发速率，给模块 100ms 喘息时间，防止串口打挂
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let clean_cmd = cmd.trim();
         info!("Sending Command: {}", clean_cmd);
         
-        // 提取当前命令的核心前缀 (例如 AT^HCSQ? -> 提取出 ^HCSQ)
+        // 智能提取当前查询的期望前缀
         let expected_prefix = if clean_cmd.starts_with("AT") {
             let core = &clean_cmd[2..];
             let end = core.find(|c: char| c == '?' || c == '=').unwrap_or(core.len());
@@ -241,16 +244,21 @@ impl ATClientActor {
         } else {
             ""
         };
+
+        // 3. 发射指令
         conn.send(clean_cmd.as_bytes()).await?;
         conn.send(b"\r\n").await?;
+
         let start = std::time::Instant::now();
         let timeout_dur = Duration::from_secs(10);
         let mut response_data = String::new();
+        
         loop {
             if start.elapsed() > timeout_dur {
                 let _ = reply_tx.send(ATResponse::error("Timeout".to_string()));
                 return Ok(());
             }
+
             match timeout(Duration::from_secs(1), conn.receive(&mut buf)).await {
                 Ok(Ok(n)) => {
                     if n == 0 { 
