@@ -167,8 +167,6 @@ impl ATClientActor {
                         conn, 
                         &mut self.buffer, 
                         &self.handlers, 
-                        &self.notifications, 
-                        &self.cmd_tx, 
                         &self.urc_tx,
                         cmd, 
                         reply_tx
@@ -187,8 +185,6 @@ impl ATClientActor {
                             Self::process_buffer_lines(
                                 &mut self.buffer, 
                                 &self.handlers, 
-                                &self.notifications, 
-                                &self.cmd_tx,
                                 &self.urc_tx
                             ).await;
                         }
@@ -212,31 +208,32 @@ impl ATClientActor {
         conn: &mut Box<dyn ATConnection>,
         buffer: &mut Vec<u8>,
         handlers: &[Box<dyn MessageHandler>],
-        _notifications: &NotificationManager,
-        _cmd_tx: &CommandSender,
         urc_tx: &mpsc::Sender<String>,
         cmd: String,
         reply_tx: oneshot::Sender<ATResponse>
     ) -> anyhow::Result<()> {
         
-        // 1. 发射前清膛：抽干底层缓存，处理掉堆积的真实闲置 URC
+        // 1. 发射前清膛：抽干底层缓存，彻底丢弃上一条指令可能因为拥堵残留的脏数据 (防止串线)
         let mut buf = [0u8; 1024];
-        while let Ok(Ok(n)) = timeout(Duration::from_millis(5), conn.receive(&mut buf)).await {
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(10), conn.receive(&mut buf)).await {
             if n == 0 { break; }
             buffer.extend_from_slice(&buf[..n]);
         }
         while let Some(line) = extract_next_line(buffer) {
-            let _ = urc_tx.send(line.clone()).await;
-            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
-                let _ = tx.send(serde_json::json!({"type": "raw_data", "data": line}).to_string());
+            // 滞留的数据中如果混有短信等重要 URC，悄悄处理，但绝不作为 raw_data 全局广播
+            if Self::is_urc(handlers, &line) {
+                let _ = urc_tx.send(line).await;
+            } else {
+                debug!("Dropped stray buffer data before send: {}", line);
             }
         }
 
-        // 2. 硬件保护：强制限制 AT 指令并发速率，防止模块宕机
+        // 2. 硬件保护：强制限制 AT 指令并发速率，给模块 100ms 喘息时间，防止串口打挂
         tokio::time::sleep(Duration::from_millis(100)).await;
         let clean_cmd = cmd.trim();
         info!("Sending Command: {}", clean_cmd);
-        // 【核心修复】：智能提取当前查询的期望前缀 (例如 "AT^HCSQ?" 提取出 "^HCSQ")
+        
+        // 提取当前命令的核心前缀 (例如 AT^HCSQ? -> 提取出 ^HCSQ)
         let expected_prefix = if clean_cmd.starts_with("AT") {
             let core = &clean_cmd[2..];
             let end = core.find(|c: char| c == '?' || c == '=').unwrap_or(core.len());
@@ -265,13 +262,13 @@ impl ATClientActor {
                     while let Some(line) = extract_next_line(buffer) {
                         debug!("RCV: {}", line);
                         
-                        // 校验这行数据是不是针对我们当前命令的直接回答
+                        // 校验这行数据是不是针对我们当前命令的回应
                         let mut is_my_response = false;
                         if !expected_prefix.is_empty() && line.starts_with(expected_prefix) {
                             is_my_response = true;
                         }
                         
-                        // 3. 【切断死循环】：如果它匹配 URC 且 "不是我们主动问的"，才判定为真实的自发变动
+                        // 3. 【切断死循环核心】：如果是 URC，且"不是我主动查的响应"，才去广播
                         if Self::is_urc(handlers, &line) && !is_my_response {
                             let _ = urc_tx.send(line.clone()).await;
                             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
@@ -281,9 +278,9 @@ impl ATClientActor {
                                 }).to_string();
                                 let _ = tx.send(ws_msg);
                             }
-                            continue; // 直接跳过，不放入 response_data
+                            continue; // 广播完直接跳过，不要混进本次回应里
                         }
-                        // 正常的查询结果，稳稳妥妥地放进回应包里返回给前端
+                        // 正常的查询结果，精准拼装
                         if line == "OK" {
                              response_data.push_str("OK");
                              let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
@@ -314,24 +311,16 @@ impl ATClientActor {
     async fn process_buffer_lines(
         buffer: &mut Vec<u8>,
         handlers: &[Box<dyn MessageHandler>],
-        _notifications: &NotificationManager,
-        _cmd_tx: &CommandSender,
         urc_tx: &mpsc::Sender<String>
     ) {
          while let Some(line) = extract_next_line(buffer) {
              debug!("URC/Idle: {}", line);
-             
-             // 广播所有原始数据给 Vue 前端，用于驱动信号图表和 AT 终端
-             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
-                 let ws_msg = serde_json::json!({
-                     "type": "raw_data",
-                     "data": line.clone()
-                 }).to_string();
-                 let _ = tx.send(ws_msg);
-             }
-
              if Self::is_urc(handlers, &line) {
-                 let _ = urc_tx.send(line).await;
+                 let _ = urc_tx.send(line.clone()).await;
+                 // 【修复】：只有真正的 URC 才全局广播，避免触发前端死循环
+                 if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                     let _ = tx.send(serde_json::json!({"type": "raw_data", "data": line}).to_string());
+                 }
              }
          }
     }
