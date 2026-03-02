@@ -1,7 +1,7 @@
 {
-	"admin/services/at-webserver": {
-		"title": "AT WebServer",
-		"order": 60,
+	"admin/modem": {
+		"title": "Modem",
+		"order": 50,
 		"action": {
 			"type": "firstchild"
 		},
@@ -9,7 +9,22 @@
 			"acl": [ "luci-app-at-webserver" ]
 		}
 	},
-	"admin/services/at-webserver/config": {
+	"admin/modem/atwebserver": {
+		"title": "AT WebServer",
+		"order": 1,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/modem/modemwebui": {
+		"title": "模块管理面板",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "at-webserver/webui"
+		}
+	},
+	"admin/modem/atwebserver/config": {
 		"title": "配置",
 		"order": 10,
 		"action": {
@@ -17,7 +32,7 @@
 			"path": "at-webserver/config"
 		}
 	},
-	"admin/services/at-webserver/logs": {
+	"admin/modem/atwebserver/logs": {
 		"title": "日志查看",
 		"order": 20,
 		"action": {
@@ -25,7 +40,7 @@
 			"path": "at-webserver/logs"
 		}
 	},
-	"admin/services/at-webserver/debug": {
+	"admin/modem/atwebserver/debug": {
 		"title": "AT调试",
 		"order": 30,
 		"action": {
