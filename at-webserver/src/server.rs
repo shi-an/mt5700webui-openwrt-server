@@ -146,24 +146,34 @@ async fn handle_client(
             Some(result) = rx.next() => {
                 match result {
                     Ok(msg) => {
-                        if msg.is_text() {
-                            if let Ok(text) = msg.to_str() {
-                                // Handle manual ping
-                                if text == "ping" {
-                                    if let Err(e) = tx.send(warp::ws::Message::text("pong")).await {
-                                        error!("Failed to send pong: {}", e);
-                                        break;
-                                    }
-                                    continue;
-                                }
+                         // 1. 兼容文本和二进制帧，防止无法读取导致忽略请求
+                         let text = if msg.is_text() {
+                             msg.to_str().unwrap_or("")
+                         } else if msg.is_binary() {
+                             std::str::from_utf8(msg.as_bytes()).unwrap_or("")
+                         } else {
+                             continue; // warp 内部的 Ping/Close 帧正常跳过
+                         };
 
-                                let mut cmd_str = if let Ok(json_cmd) = serde_json::from_str::<WSCommand>(text) {
-                                    json_cmd.command
-                                } else {
-                                    text.to_string() // Assume raw string
-                                };
+                         // 2. 【核心修复】：心跳包必须回复合法的 JSON！否则会把前端 JSON.parse 搞崩溃引发死锁
+                         if text.trim() == "ping" || text.is_empty() {
+                             let _ = tx.send(warp::ws::Message::text(r#"{"success":true,"data":"pong","error":null}"#)).await;
+                             continue;
+                         }
 
-                                info!("WS Command: {}", cmd_str);
+                         // 3. 【核心修复】：解析失败时，必须给前端返回 JSON 错误，绝不能直接 continue 导致前端无限等待！
+                         let req: WSCommand = match serde_json::from_str(text) {
+                             Ok(r) => r,
+                             Err(e) => {
+                                 warn!("忽略无效的 WS 消息: {} (错误: {})", text, e);
+                                 let err_msg = format!(r#"{{"success":false,"error":"Invalid Request: {}"}}"#, e);
+                                 let _ = tx.send(warp::ws::Message::text(err_msg)).await;
+                                 continue;
+                             }
+                         };
+                         let mut cmd_str = req.command;
+
+                         info!("WS Command: {}", cmd_str);
 
                                 // Special handling for AT+CONNECT?
                                 if cmd_str.trim() == "AT+CONNECT?" {
@@ -255,8 +265,6 @@ async fn handle_client(
                                         let _ = tx.send(warp::ws::Message::text(err_resp.to_string())).await;
                                     }
                                 }
-                            }
-                        }
                     }
                     Err(e) => {
                         error!("WebSocket error: {}", e);
