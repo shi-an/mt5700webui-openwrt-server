@@ -155,11 +155,11 @@ async fn handle_client(
                              continue; // warp 内部的 Ping/Close 帧正常跳过
                          };
 
-                         // 2. 【核心修复】：心跳包必须回复合法的 JSON！否则会把前端 JSON.parse 搞崩溃引发死锁
+                        // 2. 【极其关键】：心跳包必须严格回复纯文本 "pong"
+                        // 绝对不能返回 JSON！否则会被 Vue 前端拦截并当作 AT 指令结果，导致指令全面错位！
                         if text.trim() == "ping" || text.is_empty() {
-                            let pong_json = r#"{"success":true,"data":"pong","error":null}"#;
-                            if let Err(e) = tx.send(warp::ws::Message::text(pong_json)).await {
-                                error!("Failed to send pong: {}", e);
+                            if let Err(e) = tx.send(warp::ws::Message::text("pong")).await {
+                                log::error!("Failed to send pong: {}", e);
                                 break;
                             }
                             continue;
