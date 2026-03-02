@@ -16,7 +16,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     if pdp_type.contains("ipv4") {
         uci_batch.push_str("set network.wan_modem=interface\n");
         uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
-        uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
+        uci_batch.push_str(&format!("set network.wan_modem.ifname='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem.metric='10'\n");
         
         if !net_config.dns_list.is_empty() {
@@ -32,7 +32,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     if pdp_type.contains("ipv6") {
         uci_batch.push_str("set network.wan_modem6=interface\n");
         uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
-        uci_batch.push_str("set network.wan_modem6.device='@wan_modem'\n");
+        uci_batch.push_str("set network.wan_modem6.ifname='@wan_modem'\n");
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
         
         // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
@@ -63,6 +63,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
             uci add_list firewall.$WAN_ZONE.network='wan_modem6'
             uci commit firewall
         fi
+        
         exit 0
     "#;
     let _ = run_command("sh", &["-c", fw_script]).await;
