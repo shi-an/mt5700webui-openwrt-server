@@ -291,6 +291,20 @@ impl ATClientActor {
                         // 正常的查询结果，精准拼装
                         if line == "OK" {
                              response_data.push_str("OK");
+                             
+                             // 【终极绝杀补丁】：Vue 前端严格模式兼容 (Prefix Forging)
+                             // 如果 Vue 期望一个前缀，但模块返回的是纯数据（如 CGSN 的 IMEI）或纯 OK，我们强行伪造前缀骗过 Vue 的校验
+                             if !expected_prefix.is_empty() && !response_data.contains(expected_prefix) {
+                                 let data_only = response_data.replace("OK", "").trim().to_string();
+                                 if data_only.is_empty() {
+                                     // 纯 OK 响应（如 AT+CMGF=0），追加伪造的前缀
+                                     response_data = format!("{}\r\nOK", expected_prefix);
+                                 } else {
+                                     // 纯数据响应（如 AT+CGSN 返回 864...），按标准格式拼装前缀
+                                     response_data = format!("{}: {}\r\nOK", expected_prefix, data_only);
+                                 }
+                             }
+                             
                              let _ = reply_tx.send(ATResponse::ok(Some(response_data)));
                              return Ok(());
                         } else if line.contains("ERROR") {
