@@ -6,7 +6,9 @@ use tokio::process::Command;
 pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     info!("Configuring modem network for interface: {}", ifname);
     let net_config = &config.advanced_network_config;
-    let pdp_type = &net_config.pdp_type;
+    let pdp_type = net_config.pdp_type.to_lowercase();
+    
+    info!("Network setup: ifname={}, pdp_type={}", ifname, pdp_type);
     
     // 使用 uci batch 批量构建命令，极大地减少系统 fork 进程的开销
     let mut uci_batch = String::new();
@@ -32,7 +34,8 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     if pdp_type.contains("ipv6") {
         uci_batch.push_str("set network.wan_modem6=interface\n");
         uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
-        uci_batch.push_str("set network.wan_modem6.ifname='@wan_modem'\n");
+        // 使用物理接口而不是逻辑别名，提高兼容性
+        uci_batch.push_str(&format!("set network.wan_modem6.ifname='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
         
         // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
