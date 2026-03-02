@@ -202,7 +202,7 @@ return view.extend({
 		o.placeholder = 'auto';
 
 		o = s.taboption('network', form.Flag, 'ra_master', _('IPv6 RA Master'), _('启用后作为 IPv6 RA 主设备（分配 IPv6 地址）'));
-		o.default = '0';
+		o.default = '1';
 		o.depends('pdp_type', 'ipv6');
 		o.depends('pdp_type', 'ipv4v6');
 		
@@ -213,6 +213,8 @@ return view.extend({
 		
 		o = s.taboption('network', form.DynamicList, 'dns_list', _('自定义 DNS'), _('留空则自动使用运营商下发的 DNS。填写后将强制使用此处指定的 DNS 服务器。'));
 		o.datatype = 'ipaddr';
+		o.optional = true;
+		o.rmempty = true;
 
 		// 1. 添加标题和主开关
 		o = s.taboption('network', form.DummyValue, '_schedule_title', '<br/><strong style="color:#0099CC;">━━━━━━━ 定时锁频 (计划任务) ━━━━━━━</strong>');

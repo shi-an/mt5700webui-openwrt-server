@@ -205,7 +205,7 @@ impl Default for Config {
             advanced_network_config: AdvancedNetworkConfig {
                 pdp_type: "ipv4v6".to_string(),
                 ifname: "auto".to_string(),
-                ra_master: false,
+                ra_master: true,
                 extend_prefix: true,
                 dns_list: vec![],
                 init_at_cmds: vec![],
@@ -405,7 +405,7 @@ impl Config {
         // Advanced Network Config
         config.advanced_network_config.pdp_type = get_str("pdp_type", "ipv4v6");
         config.advanced_network_config.ifname = get_str("ifname", "auto");
-        config.advanced_network_config.ra_master = get_bool("ra_master", false);
+        config.advanced_network_config.ra_master = get_bool("ra_master", true);
         config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
         
         // 解析列表类型的辅助函数
