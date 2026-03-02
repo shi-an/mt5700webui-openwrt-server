@@ -165,22 +165,23 @@ async fn handle_client(
                             continue;
                         }
 
-                         // 3. 【核心修复】：兼容纯文本与 JSON 格式的指令解析
+                         // 3. 【核心修复：双模兼容】：同时兼容前端的纯文本 AT 指令和 JSON 格式
                          let mut cmd_str = String::new();
-                         if text.trim().starts_with('{') {
-                             // 尝试作为 JSON 解析
-                             match serde_json::from_str::<WSCommand>(text) {
+                         let text_trimmed = text.trim();
+                         
+                         if text_trimmed.starts_with('{') {
+                             match serde_json::from_str::<WSCommand>(text_trimmed) {
                                  Ok(r) => cmd_str = r.command,
                                  Err(e) => {
-                                     warn!("忽略无效的 JSON WS 消息: {} (错误: {})", text, e);
+                                     warn!("忽略无效的 JSON 消息: {} (错误: {})", text_trimmed, e);
                                      let err_msg = format!(r#"{{"success":false,"error":"Invalid Request: {}"}}"#, e);
                                      let _ = tx.send(warp::ws::Message::text(err_msg)).await;
                                      continue;
                                  }
                              }
                          } else {
-                             // 如果前端发来的是纯文本（如 "AT+CGREG?"），直接将其视为指令
-                             cmd_str = text.trim().to_string();
+                             // 【核心致命修复】：剥离前端可能因 JSON.stringify 带来的隐形双引号，防止指令畸形
+                             cmd_str = text_trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
                          }
                      if cmd_str.is_empty() {
                          continue;

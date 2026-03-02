@@ -250,7 +250,8 @@ impl ATClientActor {
              let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
              return Ok(());
         }
-        if let Err(e) = conn.send(b"\r\n").await {
+        // 【核心致命修复】：5G 模块 AT 指令只能以 \r 结尾。绝对不能发送 \n，否则会引发模块“空指令 ERROR 抢答”，导致所有的耗时设置全军覆没！
+        if let Err(e) = conn.send(b"\r").await {
              let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
              return Ok(());
         }
