@@ -128,6 +128,9 @@ async fn handle_client(
     let mut log_rx = log_rx.resubscribe();
     let mut ws_raw_rx = WS_BROADCASTER.get().unwrap().subscribe();
 
+    // 【步骤1】：新增一个专门用于异步接收后台 AT 指令结果的通道
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<String>(32);
+
     // Start heartbeat loop (optional, but good for keepalive)
     // For warp/tungstenite, ping/pong is handled automatically at protocol level usually,
     // but python version sends 'ping' text. We can implement similar logic if needed.
@@ -139,6 +142,13 @@ async fn handle_client(
             Ok(broadcast_msg) = ws_raw_rx.recv() => {
                  if let Err(e) = tx.send(warp::ws::Message::text(broadcast_msg)).await {
                      debug!("Failed to send broadcast to WS: {}", e);
+                     break;
+                 }
+            }
+            // 【步骤2】：监听后台发回的异步 AT 指令结果，并秒发给前端
+            Some(resp_str) = conn_rx.recv() => {
+                 if let Err(e) = tx.send(warp::ws::Message::text(resp_str)).await {
+                     log::debug!("Failed to send async response to WS: {}", e);
                      break;
                  }
             }
@@ -244,40 +254,44 @@ async fn handle_client(
                                     cmd_str.push('\r');
                                 }
                                 
-                                let (resp_tx, resp_rx) = oneshot::channel();
-                                if let Err(e) = sender.send((cmd_str.clone(), resp_tx)).await {
-                                    error!("Failed to send command to actor: {}", e);
-                                    break;
-                                }
+                                // 【步骤3】：将耗时的发送和等待过程剥离到独立的后台协程中，彻底解放主循环！
+                                let sender_clone = sender.clone();
+                                let conn_tx_clone = conn_tx.clone();
+                                let cmd_for_task = cmd_str.clone();
+                                
+                                tokio::spawn(async move {
+                                    let (resp_tx, resp_rx) = oneshot::channel();
+                                    if let Err(e) = sender_clone.send((cmd_for_task.clone(), resp_tx)).await {
+                                        log::error!("Failed to send command to actor: {}", e);
+                                        return;
+                                    }
 
-                                match resp_rx.await {
-                                    Ok(response) => {
-                                        // 务必过滤掉发送的回显命令，只保留数据载荷，Vue前端严格依赖此格式！
-                                        let mut filtered_data = response.data.clone();
-                                        if let Some(data) = &filtered_data {
-                                            let clean_cmd = cmd_str.trim();
-                                            let lines: Vec<&str> = data.lines()
-                                                .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
-                                                .collect();
-                                            filtered_data = Some(lines.join("\r\n"));
+                                    match resp_rx.await {
+                                        Ok(response) => {
+                                            let mut filtered_data = response.data.clone();
+                                            if let Some(data) = &filtered_data {
+                                                let clean_cmd = cmd_for_task.trim();
+                                                let lines: Vec<&str> = data.lines()
+                                                    .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
+                                                    .collect();
+                                                filtered_data = Some(lines.join("\r\n"));
+                                            }
+                                            let ws_resp = WSResponse {
+                                                success: response.success,
+                                                data: filtered_data,
+                                                error: response.error,
+                                            };
+                                            if let Ok(json_resp) = serde_json::to_string(&ws_resp) {
+                                                let _ = conn_tx_clone.send(json_resp).await;
+                                            }
                                         }
-                                        let ws_resp = WSResponse {
-                                            success: response.success,
-                                            data: filtered_data,
-                                            error: response.error,
-                                        };
-                                        let json_resp = serde_json::to_string(&ws_resp).unwrap();
-                                        if let Err(e) = tx.send(warp::ws::Message::text(json_resp)).await {
-                                            error!("Failed to send response to WS: {}", e);
-                                            break;
+                                        Err(e) => {
+                                            log::error!("Failed to receive response from actor: {}", e);
+                                            let err_resp = serde_json::json!({ "success": false, "error": "Internal Error" });
+                                            let _ = conn_tx_clone.send(err_resp.to_string()).await;
                                         }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to receive response from actor: {}", e);
-                                        let err_resp = json!({ "success": false, "error": "Internal Error" });
-                                        let _ = tx.send(warp::ws::Message::text(err_resp.to_string())).await;
-                                    }
-                                }
+                                });
                     }
                     Err(e) => {
                         error!("WebSocket error: {}", e);
