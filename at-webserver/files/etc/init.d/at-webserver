@@ -127,69 +127,77 @@ start_service() {
 			uci delete firewall.@rule[$rule_idx] 2>/dev/null
 		fi
 		
-		uci commit firewall
-		
 		# 模块外网访问控制
 		if [ "$module_allow_wan" -eq 1 ]; then
 			# 允许外网访问模块，添加 ACCEPT 规则
-			uci add firewall rule >/dev/null
-			uci set firewall.@rule[-1].name="at_module_wan_allow"
-			uci set firewall.@rule[-1].src='wan'
-			uci set firewall.@rule[-1].dest='*'
-			uci set firewall.@rule[-1].dest_ip="$module_host"
-			uci set firewall.@rule[-1].dest_port="$module_port"
-			uci set firewall.@rule[-1].proto='tcp'
-			uci set firewall.@rule[-1].target='ACCEPT'
-			uci set firewall.@rule[-1].enabled='1'
+			uci -q batch <<EOF
+				add firewall rule
+				set firewall.@rule[-1].name="at_module_wan_allow"
+				set firewall.@rule[-1].src='wan'
+				set firewall.@rule[-1].dest='*'
+				set firewall.@rule[-1].dest_ip="$module_host"
+				set firewall.@rule[-1].dest_port="$module_port"
+				set firewall.@rule[-1].proto='tcp'
+				set firewall.@rule[-1].target='ACCEPT'
+				set firewall.@rule[-1].enabled='1'
+EOF
 			logger -t at-webserver "已允许外网访问模块 AT 端口: $module_host:$module_port (警告: 不安全!)"
 		else
 			# 禁止外网访问模块，添加 REJECT 规则
-			uci add firewall rule >/dev/null
-			uci set firewall.@rule[-1].name="at_module_wan_block"
-			uci set firewall.@rule[-1].src='wan'
-			uci set firewall.@rule[-1].dest='*'
-			uci set firewall.@rule[-1].dest_ip="$module_host"
-			uci set firewall.@rule[-1].dest_port="$module_port"
-			uci set firewall.@rule[-1].proto='tcp'
-			uci set firewall.@rule[-1].target='REJECT'
-			uci set firewall.@rule[-1].enabled='1'
+			uci -q batch <<EOF
+				add firewall rule
+				set firewall.@rule[-1].name="at_module_wan_block"
+				set firewall.@rule[-1].src='wan'
+				set firewall.@rule[-1].dest='*'
+				set firewall.@rule[-1].dest_ip="$module_host"
+				set firewall.@rule[-1].dest_port="$module_port"
+				set firewall.@rule[-1].proto='tcp'
+				set firewall.@rule[-1].target='REJECT'
+				set firewall.@rule[-1].enabled='1'
+EOF
 			logger -t at-webserver "已禁止外网访问模块 AT 端口: $module_host:$module_port"
 		fi
 		
 		# WebSocket 外网访问控制
 		if [ "$allow_wan" -eq 1 ]; then
 			# 允许外网访问，添加 ACCEPT 规则
-			uci add firewall rule >/dev/null
-			uci set firewall.@rule[-1].name="at_webserver_wan_allow"
-			uci set firewall.@rule[-1].src='wan'
-			uci set firewall.@rule[-1].proto='tcp'
-			uci set firewall.@rule[-1].dest_port="$ws_port"
-			uci set firewall.@rule[-1].target='ACCEPT'
-			uci set firewall.@rule[-1].enabled='1'
+			uci -q batch <<EOF
+				add firewall rule
+				set firewall.@rule[-1].name="at_webserver_wan_allow"
+				set firewall.@rule[-1].src='wan'
+				set firewall.@rule[-1].proto='tcp'
+				set firewall.@rule[-1].dest_port="$ws_port"
+				set firewall.@rule[-1].target='ACCEPT'
+				set firewall.@rule[-1].enabled='1'
+EOF
 			logger -t at-webserver "已允许外网访问 WebSocket (端口 $ws_port)"
 		else
 			# 禁止外网访问，添加 REJECT 规则（更明确）
-			uci add firewall rule >/dev/null
-			uci set firewall.@rule[-1].name="at_webserver_wan_block"
-			uci set firewall.@rule[-1].src='wan'
-			uci set firewall.@rule[-1].proto='tcp'
-			uci set firewall.@rule[-1].dest_port="$ws_port"
-			uci set firewall.@rule[-1].target='REJECT'
-			uci set firewall.@rule[-1].enabled='1'
+			uci -q batch <<EOF
+				add firewall rule
+				set firewall.@rule[-1].name="at_webserver_wan_block"
+				set firewall.@rule[-1].src='wan'
+				set firewall.@rule[-1].proto='tcp'
+				set firewall.@rule[-1].dest_port="$ws_port"
+				set firewall.@rule[-1].target='REJECT'
+				set firewall.@rule[-1].enabled='1'
+EOF
 			logger -t at-webserver "已禁止外网访问 WebSocket (端口 $ws_port)"
 		fi
 		
 		# 如果启用模块访问限制，阻止局域网其他设备访问模块
 		if [ "$restrict_module" -eq 1 ]; then
-			uci add firewall rule >/dev/null
-			uci set firewall.@rule[-1].name="at_module_restrict"
-			uci set firewall.@rule[-1].src='lan'
-			uci set firewall.@rule[-1].dest='*'
-			uci set firewall.@rule[-1].dest_ip="$module_host"
-			uci set firewall.@rule[-1].dest_port="$module_port"
-			uci set firewall.@rule[-1].proto='tcp'
-			uci set firewall.@rule[-1].target='REJECT'
-			uci set firewall.@rule[-1].enabled='1'
+			uci -q batch <<EOF
+				add firewall rule
+				set firewall.@rule[-1].name="at_module_restrict"
+				set firewall.@rule[-1].src='lan'
+				set firewall.@rule[-1].dest='*'
+				set firewall.@rule[-1].dest_ip="$module_host"
+				set firewall.@rule[-1].dest_port="$module_port"
+				set firewall.@rule[-1].proto='tcp'
+				set firewall.@rule[-1].target='REJECT'
+				set firewall.@rule[-1].enabled='1'
+EOF
 			logger -t at-webserver "已限制模块访问: 仅路由器本身可访问 $module_host:$module_port"
 		else
 			logger -t at-webserver "模块访问: 允许局域网设备访问 $module_host:$module_port"
@@ -234,7 +242,7 @@ stop_service() {
         uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
         uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
         uci commit firewall
-        fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+        # fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
     fi
 }
 

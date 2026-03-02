@@ -75,8 +75,9 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     }
     
     // 统一由 OpenWrt 的 fw4 / firewall 接管重载
-    let _ = run_command("fw4", &["reload"]).await;
-    let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
+    if run_command("fw4", &["reload"]).await.is_err() {
+        let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
+    }
     
     info!("Network configuration completed.");
     Ok(())
