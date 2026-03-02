@@ -245,9 +245,15 @@ impl ATClientActor {
             ""
         };
 
-        // 3. 发射指令
-        conn.send(clean_cmd.as_bytes()).await?;
-        conn.send(b"\r\n").await?;
+        // 3. 发射指令（附带防死锁反馈机制）
+        if let Err(e) = conn.send(clean_cmd.as_bytes()).await {
+             let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
+             return Ok(());
+        }
+        if let Err(e) = conn.send(b"\r\n").await {
+             let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
+             return Ok(());
+        }
 
         let start = std::time::Instant::now();
         let timeout_dur = Duration::from_secs(10);

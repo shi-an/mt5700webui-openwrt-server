@@ -205,7 +205,7 @@ EOF
 		
 		uci commit firewall
 		# 重新加载防火墙
-		/etc/init.d/firewall reload >/dev/null 2>&1
+		/etc/init.d/firewall reload >/dev/null 2>&1 &
 	}
 	
 	setup_firewall
@@ -242,7 +242,8 @@ stop_service() {
         uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
         uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
         uci commit firewall
-        # fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+        # 异步重载防火墙
+        (fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null) &
     fi
 }
 

@@ -156,10 +156,14 @@ async fn handle_client(
                          };
 
                          // 2. 【核心修复】：心跳包必须回复合法的 JSON！否则会把前端 JSON.parse 搞崩溃引发死锁
-                         if text.trim() == "ping" || text.is_empty() {
-                             let _ = tx.send(warp::ws::Message::text(r#"{"success":true,"data":"pong","error":null}"#)).await;
-                             continue;
-                         }
+                        if text.trim() == "ping" || text.is_empty() {
+                            let pong_json = r#"{"success":true,"data":"pong","error":null}"#;
+                            if let Err(e) = tx.send(warp::ws::Message::text(pong_json)).await {
+                                error!("Failed to send pong: {}", e);
+                                break;
+                            }
+                            continue;
+                        }
 
                          // 3. 【核心修复】：解析失败时，必须给前端返回 JSON 错误，绝不能直接 continue 导致前端无限等待！
                          let req: WSCommand = match serde_json::from_str(text) {
