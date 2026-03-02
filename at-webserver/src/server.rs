@@ -165,19 +165,27 @@ async fn handle_client(
                             continue;
                         }
 
-                         // 3. 【核心修复】：解析失败时，必须给前端返回 JSON 错误，绝不能直接 continue 导致前端无限等待！
-                         let req: WSCommand = match serde_json::from_str(text) {
-                             Ok(r) => r,
-                             Err(e) => {
-                                 warn!("忽略无效的 WS 消息: {} (错误: {})", text, e);
-                                 let err_msg = format!(r#"{{"success":false,"error":"Invalid Request: {}"}}"#, e);
-                                 let _ = tx.send(warp::ws::Message::text(err_msg)).await;
-                                 continue;
+                         // 3. 【核心修复】：兼容纯文本与 JSON 格式的指令解析
+                         let mut cmd_str = String::new();
+                         if text.trim().starts_with('{') {
+                             // 尝试作为 JSON 解析
+                             match serde_json::from_str::<WSCommand>(text) {
+                                 Ok(r) => cmd_str = r.command,
+                                 Err(e) => {
+                                     warn!("忽略无效的 JSON WS 消息: {} (错误: {})", text, e);
+                                     let err_msg = format!(r#"{{"success":false,"error":"Invalid Request: {}"}}"#, e);
+                                     let _ = tx.send(warp::ws::Message::text(err_msg)).await;
+                                     continue;
+                                 }
                              }
-                         };
-                         let mut cmd_str = req.command;
-
-                         info!("WS Command: {}", cmd_str);
+                         } else {
+                             // 如果前端发来的是纯文本（如 "AT+CGREG?"），直接将其视为指令
+                             cmd_str = text.trim().to_string();
+                         }
+                     if cmd_str.is_empty() {
+                         continue;
+                     }
+                     info!("WS Command: {}", cmd_str);
 
                                 // Special handling for AT+CONNECT?
                                 if cmd_str.trim() == "AT+CONNECT?" {
