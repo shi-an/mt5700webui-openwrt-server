@@ -18,7 +18,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     if pdp_type.contains("ipv4") {
         uci_batch.push_str("set network.wan_modem=interface\n");
         uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
-        uci_batch.push_str(&format!("set network.wan_modem.ifname='{}'\n", ifname));
+        uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem.metric='10'\n");
         
         if !net_config.dns_list.is_empty() {
@@ -35,7 +35,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         uci_batch.push_str("set network.wan_modem6=interface\n");
         uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
         // 使用物理接口而不是逻辑别名，提高兼容性
-        uci_batch.push_str(&format!("set network.wan_modem6.ifname='{}'\n", ifname));
+        uci_batch.push_str(&format!("set network.wan_modem6.device='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
         
         // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
