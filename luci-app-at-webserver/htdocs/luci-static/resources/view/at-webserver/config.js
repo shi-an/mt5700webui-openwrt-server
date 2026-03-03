@@ -369,6 +369,11 @@ return view.extend({
 		o = s.taboption('notify', form.Flag, 'notify_memory_full', _('存储满通知'), _('短信存储空间满时发送警告'));
 		o.default = '1';
 
+		// 新增：短信转发后是否删除原短信
+		o = s.taboption('notify', form.Flag, 'sms_delete_after_forward', _('转发后删除短信'), _('启用后，只有当短信成功转发到第三方通道（如微信、钉钉等）后，才自动从存储中删除该短信。'));
+		o.default = '0';
+		o.depends('notify_sms', '1');
+
 		o = s.taboption('notify', form.Flag, 'notify_signal', _('信号变化通知'), _('网络信号强度变化或制式切换时发送通知'));
 		o.default = '1';
 

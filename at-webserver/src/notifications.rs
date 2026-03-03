@@ -403,4 +403,11 @@ impl NotificationManager {
             }
         }
     }
+
+    pub fn has_active_push_services(&self) -> bool {
+        // 判断是否有除了 LogNotification 之外的活跃推送通道
+        // 因为 LogNotification 只是写本地文件，不算“转发”
+        // 这里我们简单判断 enabled_push_services 是否为空
+        !self.config.enabled_push_services.is_empty()
+    }
 }

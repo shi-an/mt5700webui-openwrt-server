@@ -63,6 +63,7 @@ pub struct NotificationConfig {
     pub notify_call: bool,
     pub notify_memory_full: bool,
     pub notify_signal: bool,
+    pub sms_delete_after_forward: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ impl Default for Config {
                 notify_call: true,
                 notify_memory_full: true,
                 notify_signal: true,
+                sms_delete_after_forward: false,
             },
             websocket_config: WebSocketConfig {
                 ipv4: IpConfig {
@@ -361,6 +363,7 @@ impl Config {
         config.notification_config.notify_call = get_bool("notify_call", true);
         config.notification_config.notify_memory_full = get_bool("notify_memory_full", true);
         config.notification_config.notify_signal = get_bool("notify_signal", true);
+        config.notification_config.sms_delete_after_forward = get_bool("sms_delete_after_forward", false);
 
         // WebSocket Config
         let ws_port = get_u16("websocket_port", 8765);

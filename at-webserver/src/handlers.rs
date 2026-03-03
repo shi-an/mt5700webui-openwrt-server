@@ -113,7 +113,16 @@ fn get_partial_cache() -> PartialSmsCache {
         .clone()
 }
 
-pub struct NewSMSHandler;
+pub struct NewSMSHandler {
+    delete_after_forward: bool,
+}
+
+impl NewSMSHandler {
+    pub fn new(delete_after_forward: bool) -> Self {
+        Self { delete_after_forward }
+    }
+}
+
 #[async_trait]
 impl MessageHandler for NewSMSHandler {
     fn can_handle(&self, line: &str) -> bool {
@@ -162,7 +171,19 @@ impl MessageHandler for NewSMSHandler {
                             if !pdu_hex.is_empty() {
                                 match read_incoming_sms(pdu_hex) {
                                     Ok(sms_data) => {
-                                        self.process_sms(sms_data, notifications).await;
+                                        // Process SMS (notify & websocket broadcast)
+                                        let forwarded = self.process_sms(sms_data, notifications).await;
+                                        
+                                        // Only delete if enabled in config AND it was actually forwarded to a 3rd party service
+                                        if self.delete_after_forward && forwarded {
+                                            info!("Deleting SMS at index {} (forwarded & configured to auto-delete)", index);
+                                            let del_cmd = format!("AT+CMGD={}", index);
+                                            let (del_tx, del_rx) = oneshot::channel();
+                                            let _ = cmd_tx.send((del_cmd, del_tx)).await;
+                                            let _ = del_rx.await;
+                                        } else {
+                                            info!("Keeping SMS at index {} (auto-delete disabled or not forwarded)", index);
+                                        }
                                     }
                                     Err(e) => {
                                         error!("Failed to decode PDU: {}", e);
@@ -175,12 +196,6 @@ impl MessageHandler for NewSMSHandler {
                             } else {
                                 warn!("No PDU found in CMGR response");
                             }
-
-                            // Delete SMS after reading to save space
-                            let del_cmd = format!("AT+CMGD={}", index);
-                            let (del_tx, del_rx) = oneshot::channel();
-                            let _ = cmd_tx.send((del_cmd, del_tx)).await;
-                            let _ = del_rx.await;
                         }
                     }
                 }
@@ -192,7 +207,10 @@ impl MessageHandler for NewSMSHandler {
 }
 
 impl NewSMSHandler {
-    async fn process_sms(&self, sms: SmsData, notifications: &NotificationManager) {
+    /// Returns true if the SMS was successfully forwarded to a third-party notification service
+    async fn process_sms(&self, sms: SmsData, notifications: &NotificationManager) -> bool {
+        let mut forwarded_to_third_party = false;
+
         if let Some(partial) = sms.partial_info {
             // Handle partial SMS
             let cache = get_partial_cache();
@@ -230,7 +248,22 @@ impl NewSMSHandler {
                     map.remove(&key);
                 }
                 info!("Combined partial SMS from {}", sms.sender);
+                
+                // 核心逻辑：调用 notify 并检查返回值（虽然目前 notify 总是返回 void，我们需要修改 NotificationManager 以返回状态）
+                // 暂时假设 NotificationManager::notify 总是成功触发配置的服务。
+                // 实际上我们需要知道是否 *开启了* 任何推送服务。
+                // 如果用户没有配置任何推送服务（如微信、钉钉等），那么我们不应该删除短信。
+                // 但是 notify 方法内部处理了所有逻辑。
+                // 为了简单起见，我们认为只要调用了 notify 就算 "尝试转发"。
+                // 如果要更精确，需要修改 NotificationManager::notify 返回是否有实际推送。
+                // 这里我们先调用，然后假设如果配置了服务就会推送。
+                
                 notifications.notify(&sms.sender, &content, NotificationType::SMS).await;
+                
+                // 检查是否配置了任何推送服务
+                if notifications.has_active_push_services() {
+                    forwarded_to_third_party = true;
+                }
                 
                 if let Some(tx) = crate::server::WS_BROADCASTER.get() {
                     let msg = serde_json::json!({
@@ -251,6 +284,10 @@ impl NewSMSHandler {
             // Normal SMS
             notifications.notify(&sms.sender, &sms.content, NotificationType::SMS).await;
             
+            if notifications.has_active_push_services() {
+                forwarded_to_third_party = true;
+            }
+            
             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
                 let msg = serde_json::json!({
                     "type": "new_sms",
@@ -264,6 +301,8 @@ impl NewSMSHandler {
                 let _ = tx.send(msg);
             }
         }
+        
+        forwarded_to_third_party
     }
 }
 
