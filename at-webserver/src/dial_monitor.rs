@@ -136,22 +136,27 @@ async fn check_ip_status(at_client: &ATClient) -> Result<bool> {
 }
 
 async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
-    // 默认兜底使用 1 号 PDP
-    let mut profile_id = 1;
+    let mut data_profile_id = 1; // 默认上网通道
+    let mut ims_profile_id: Option<u32> = None; // 动态寻找的 IMS 通道
 
-    // 1. 向 5G 模块查询当前的自动拨号配置，解析前端存进去的 profile_id
-    let resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
-    if let Ok(response) = resp {
+    // 1. 查询自动拨号配置，获取前端设定的【上网业务 CID】
+    let resp_dial = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
+    if let Ok(response) = resp_dial {
         if let Some(content) = response.data {
             for line in content.lines() {
                 let line = line.trim();
                 if line.starts_with("^SETAUTODIAL:") {
-                    // 解析诸如 ^SETAUTODIAL:1,2,"IPV4V6"...
                     let parts: Vec<&str> = line.trim_start_matches("^SETAUTODIAL:").split(',').collect();
                     if parts.len() >= 2 {
-                        // 提取前端设置的 PDP Profile ID (例如 2)
+                        let enable_flag = parts[0].trim();
+                        // 拦截：如果前端关闭了拨号，直接中断
+                        if enable_flag == "0" {
+                            info!("Auto-dial is disabled in hardware. Aborting perform_dial.");
+                            return Ok(());
+                        }
+                        // 提取前端设置的上网 PDP Profile ID
                         if let Ok(id) = parts[1].trim().parse::<u32>() {
-                            profile_id = id;
+                            data_profile_id = id;
                         }
                     }
                 }
@@ -159,21 +164,48 @@ async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
         }
     }
 
-    info!("Attempting to activate PDP context profile ID: {}", profile_id);
+    // 2. 扫描所有配置文件，动态揪出【IMS 业务 CID】
+    let resp_pdp = at_client.send_command("AT+CGDCONT?".to_string()).await;
+    if let Ok(response) = resp_pdp {
+        if let Some(content) = response.data {
+            for line in content.lines() {
+                let line = line.trim();
+                // 只要这行的 APN 包含 "ims" (忽略大小写)
+                if line.starts_with("+CGDCONT:") && line.to_lowercase().contains("\"ims\"") {
+                    let parts: Vec<&str> = line.trim_start_matches("+CGDCONT:").split(',').collect();
+                    if let Some(id_str) = parts.first() {
+                        if let Ok(id) = id_str.trim().parse::<u32>() {
+                            ims_profile_id = Some(id);
+                            break; // 找到了就跳出
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    // 2. 动态拼接激活指令，使用前端选定的通道！
-    // 彻底删除了强行发 AT+CGDCONT="auto" 的代码，原汁原味使用用户的 APN 配置
-    let qnet_cmd = format!("AT+QNETDEVCTL={},1,1", profile_id);
+    // 3. 激活【上网业务通道】
+    info!("Activating Data Profile ID: {}", data_profile_id);
+    let qnet_cmd = format!("AT+QNETDEVCTL={},1,1", data_profile_id);
     let _ = at_client.send_command(qnet_cmd).await;
     
-    let cgact_cmd = format!("AT+CGACT={},1", profile_id);
-    let _ = at_client.send_command(cgact_cmd).await;
+    let cgact_data_cmd = format!("AT+CGACT={},1", data_profile_id);
+    let _ = at_client.send_command(cgact_data_cmd).await;
 
-    // 3. Fallback for Fibocom FM350 and others using PDP 0 (仅在 profile 1 时适用)
-    if profile_id == 1 {
+    // (应对某些老固件喜欢用 0 号通道的祖传 Bug)
+    if data_profile_id == 1 {
         let _ = at_client.send_command("AT+CGACT=1,0".to_string()).await;
     }
-    
+
+    // 4. 激活【IMS 业务通道】(保障短信和 VoLTE)
+    if let Some(ims_id) = ims_profile_id {
+        info!("Activating IMS Profile ID: {}", ims_id);
+        let cgact_ims_cmd = format!("AT+CGACT={},1", ims_id);
+        let _ = at_client.send_command(cgact_ims_cmd).await;
+    } else {
+        warn!("No IMS profile found! SMS and VoLTE might not work.");
+    }
+
     Ok(())
 }
 
