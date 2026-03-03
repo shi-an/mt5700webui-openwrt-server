@@ -156,142 +156,106 @@ async fn handle_client(
             Some(result) = rx.next() => {
                 match result {
                     Ok(msg) => {
-                         // 1. 兼容文本和二进制帧，防止无法读取导致忽略请求
                          let text = if msg.is_text() {
                              msg.to_str().unwrap_or("")
                          } else if msg.is_binary() {
                              std::str::from_utf8(msg.as_bytes()).unwrap_or("")
                          } else {
-                             continue; // warp 内部的 Ping/Close 帧正常跳过
+                             continue;
                          };
 
-                        // 2. 【极其关键】：心跳包必须严格回复纯文本 "pong"
-                        // 绝对不能返回 JSON！否则会被 Vue 前端拦截并当作 AT 指令结果，导致指令全面错位！
-                        if text.trim() == "ping" || text.is_empty() {
-                            if let Err(e) = tx.send(warp::ws::Message::text("pong")).await {
-                                log::error!("Failed to send pong: {}", e);
-                                break;
-                            }
-                            continue;
-                        }
+                         // 【复刻 Python】：直接回复纯文本 pong，且不被后续流程阻塞
+                         if text.trim() == "ping" || text.is_empty() {
+                             if let Err(e) = tx.send(warp::ws::Message::text("pong")).await {
+                                 error!("Failed to send pong: {}", e);
+                                 break;
+                             }
+                             continue;
+                         }
 
-                         // 3. 【核心修复：双模兼容】：同时兼容前端的纯文本 AT 指令和 JSON 格式
-                         let mut cmd_str = String::new();
-                         let text_trimmed = text.trim();
+                         // 【复刻 Python】：放弃严格的 JSON 校验，直接将前端发来的文本作为指令！
+                         // 剥离可能存在的外部双引号，防止前端 JSON.stringify 污染指令
+                         let mut cmd_str = text.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                         if cmd_str.is_empty() { continue; }
+                         info!("WS Command: {}", cmd_str);
+
+                         if cmd_str.trim() == "AT+CONNECT?" {
+                             let resp = WSResponse { success: true, data: Some("+CONNECT: 0\r\nOK".to_string()), error: None };
+                             let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
+                             continue;
+                         }
                          
-                         if text_trimmed.starts_with('{') {
-                             match serde_json::from_str::<WSCommand>(text_trimmed) {
-                                 Ok(r) => cmd_str = r.command,
-                                 Err(e) => {
-                                     warn!("忽略无效的 JSON 消息: {} (错误: {})", text_trimmed, e);
-                                     let err_msg = format!(r#"{{"success":false,"error":"Invalid Request: {}"}}"#, e);
-                                     let _ = tx.send(warp::ws::Message::text(err_msg)).await;
-                                     continue;
+                         if cmd_str.trim() == "GET_SYS_LOGS" {
+                             let content = match tokio::fs::read_to_string(log_path.as_str()).await {
+                                 Ok(c) => c, Err(_) => "".to_string(),
+                             };
+                             let resp = WSResponse { success: true, data: Some(content), error: None };
+                             let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
+                             continue;
+                         }
+
+                         if cmd_str.trim() == "CLEAR_SYS_LOGS" {
+                             let success = tokio::fs::write(log_path.as_str(), "").await.is_ok();
+                             let resp = WSResponse {
+                                 success, data: if success { Some("Logs cleared".to_string()) } else { None },
+                                 error: if success { None } else { Some("Failed to clear logs".to_string()) },
+                             };
+                             let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
+                             continue;
+                         }
+
+                         if cmd_str.starts_with("AT^SYSCFGEX") {
+                             cmd_str = cmd_str.replace('\n', "").replace('\r', "").replace("OK", "");
+                             if cmd_str.contains(",\"\",\"\"") {
+                                 let parts: Vec<&str> = cmd_str.split(',').collect();
+                                 if parts.len() >= 5 {
+                                     let bands = parts[4].trim_matches('"');
+                                     cmd_str = format!("{},{},{},{},\"{}\",\"\",\"\"", parts[0], parts[1], parts[2], parts[3], bands);
                                  }
                              }
-                         } else {
-                             // 【核心致命修复】：剥离前端可能因 JSON.stringify 带来的隐形双引号，防止指令畸形
-                             cmd_str = text_trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
+                             cmd_str.push('\r');
                          }
-                     if cmd_str.is_empty() {
-                         continue;
-                     }
-                     info!("WS Command: {}", cmd_str);
+                         
+                         // 【异步并发】：将指令发给后端执行，主循环立刻回头去接客，绝不卡死 WebSocket！
+                         let sender_clone = sender.clone();
+                         // WebSocket 发送端 (tx) 通常不能直接克隆 (SplitSink 没有 Clone)。
+                         // 我们这里使用之前创建的 conn_tx 通道将结果发回主循环，由主循环统一发送给 WebSocket。
+                         let conn_tx_clone = conn_tx.clone();
+                         let cmd_for_task = cmd_str.clone();
+                         
+                         tokio::spawn(async move {
+                             let (resp_tx, resp_rx) = oneshot::channel();
+                             if let Err(e) = sender_clone.send((cmd_for_task.clone(), resp_tx)).await {
+                                 error!("Failed to send command to actor: {}", e);
+                                 return;
+                             }
 
-                                // Special handling for AT+CONNECT?
-                                if cmd_str.trim() == "AT+CONNECT?" {
-                                    // Assume connected for now or implement check
-                                    // In Python: returns +CONNECT: 0 (Network) or 1 (Serial)
-                                    // We can hardcode 0 for now as most use network
-                                    let resp = WSResponse {
-                                        success: true,
-                                        data: Some("+CONNECT: 0\r\nOK".to_string()),
-                                        error: None,
-                                    };
-                                    let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
-                                    continue;
-                                }
-                                
-                                // Handle GET_SYS_LOGS
-                                if cmd_str.trim() == "GET_SYS_LOGS" {
-                                    let content = match tokio::fs::read_to_string(log_path.as_str()).await {
-                                        Ok(c) => c,
-                                        Err(_) => "".to_string(),
-                                    };
-                                    // Wrap in standard AT response format or just raw? 
-                                    // Python version returned raw content usually, but here we use WSResponse wrapper
-                                    let resp = WSResponse {
-                                        success: true,
-                                        data: Some(content),
-                                        error: None,
-                                    };
-                                    let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
-                                    continue;
-                                }
-
-                                // Handle CLEAR_SYS_LOGS
-                                if cmd_str.trim() == "CLEAR_SYS_LOGS" {
-                                    let success = tokio::fs::write(log_path.as_str(), "").await.is_ok();
-                                    let resp = WSResponse {
-                                        success,
-                                        data: if success { Some("Logs cleared".to_string()) } else { None },
-                                        error: if success { None } else { Some("Failed to clear logs".to_string()) },
-                                    };
-                                    let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
-                                    continue;
-                                }
-
-                                // Filter/Sanitize AT^SYSCFGEX
-                                if cmd_str.starts_with("AT^SYSCFGEX") {
-                                    cmd_str = cmd_str.replace('\n', "").replace('\r', "").replace("OK", "");
-                                    if cmd_str.contains(",\"\",\"\"") {
-                                        let parts: Vec<&str> = cmd_str.split(',').collect();
-                                        if parts.len() >= 5 {
-                                            let bands = parts[4].trim_matches('"');
-                                            cmd_str = format!("{},{},{},{},\"{}\",\"\",\"\"", parts[0], parts[1], parts[2], parts[3], bands);
-                                        }
-                                    }
-                                    cmd_str.push('\r');
-                                }
-                                
-                                // 【步骤3】：将耗时的发送和等待过程剥离到独立的后台协程中，彻底解放主循环！
-                                let sender_clone = sender.clone();
-                                let conn_tx_clone = conn_tx.clone();
-                                let cmd_for_task = cmd_str.clone();
-                                
-                                tokio::spawn(async move {
-                                    let (resp_tx, resp_rx) = oneshot::channel();
-                                    if let Err(e) = sender_clone.send((cmd_for_task.clone(), resp_tx)).await {
-                                        log::error!("Failed to send command to actor: {}", e);
-                                        return;
-                                    }
-
-                                    match resp_rx.await {
-                                        Ok(response) => {
-                                            let mut filtered_data = response.data.clone();
-                                            if let Some(data) = &filtered_data {
-                                                let clean_cmd = cmd_for_task.trim();
-                                                let lines: Vec<&str> = data.lines()
-                                                    .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
-                                                    .collect();
-                                                filtered_data = Some(lines.join("\r\n"));
-                                            }
-                                            let ws_resp = WSResponse {
-                                                success: response.success,
-                                                data: filtered_data,
-                                                error: response.error,
-                                            };
-                                            if let Ok(json_resp) = serde_json::to_string(&ws_resp) {
-                                                let _ = conn_tx_clone.send(json_resp).await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to receive response from actor: {}", e);
-                                            let err_resp = serde_json::json!({ "success": false, "error": "Internal Error" });
-                                            let _ = conn_tx_clone.send(err_resp.to_string()).await;
-                                        }
-                                    }
-                                });
+                             match resp_rx.await {
+                                 Ok(response) => {
+                                     let mut filtered_data = response.data.clone();
+                                     if let Some(data) = &filtered_data {
+                                         let clean_cmd = cmd_for_task.trim();
+                                         let lines: Vec<&str> = data.lines()
+                                             .filter(|line| !line.trim().is_empty() && line.trim() != clean_cmd)
+                                             .collect();
+                                         filtered_data = Some(lines.join("\r\n"));
+                                     }
+                                     let ws_resp = WSResponse {
+                                         success: response.success,
+                                         data: filtered_data,
+                                         error: response.error,
+                                     };
+                                     if let Ok(json_resp) = serde_json::to_string(&ws_resp) {
+                                         let _ = conn_tx_clone.send(json_resp).await;
+                                     }
+                                 }
+                                 Err(e) => {
+                                     error!("Failed to receive response from actor: {}", e);
+                                     let err_resp = json!({ "success": false, "error": "Internal Error" });
+                                     let _ = conn_tx_clone.send(err_resp.to_string()).await;
+                                 }
+                             }
+                         });
                     }
                     Err(e) => {
                         error!("WebSocket error: {}", e);
