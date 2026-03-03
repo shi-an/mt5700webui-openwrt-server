@@ -135,27 +135,44 @@ async fn check_ip_status(at_client: &ATClient) -> Result<bool> {
     Ok(false)
 }
 
-async fn perform_dial(config: &Config, at_client: &ATClient) -> Result<()> {
-    // 1. Set APN
-    // Format: AT+CGDCONT=1,"IP_TYPE","APN"
-    // We assume "auto" for APN as per instructions, or maybe empty? 
-    // Instructions said: AT+CGDCONT=1,"IPV4V6","auto"
-    let pdp_type = config.advanced_network_config.pdp_type.to_uppercase();
-    // Ensure pdp_type is valid for AT command (IP, IPV6, IPV4V6)
-    let at_pdp_type = if pdp_type.contains("IPV4V6") {
-        "IPV4V6"
-    } else if pdp_type.contains("IPV6") {
-        "IPV6"
-    } else {
-        "IP" // Default to IP (IPv4)
-    };
+async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
+    // 默认兜底使用 1 号 PDP
+    let mut profile_id = 1;
+
+    // 1. 向 5G 模块查询当前的自动拨号配置，解析前端存进去的 profile_id
+    let resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
+    if let Ok(response) = resp {
+        if let Some(content) = response.data {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with("^SETAUTODIAL:") {
+                    // 解析诸如 ^SETAUTODIAL:1,2,"IPV4V6"...
+                    let parts: Vec<&str> = line.trim_start_matches("^SETAUTODIAL:").split(',').collect();
+                    if parts.len() >= 2 {
+                        // 提取前端设置的 PDP Profile ID (例如 2)
+                        if let Ok(id) = parts[1].trim().parse::<u32>() {
+                            profile_id = id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Attempting to activate PDP context profile ID: {}", profile_id);
+
+    // 2. 动态拼接激活指令，使用前端选定的通道！
+    // 彻底删除了强行发 AT+CGDCONT="auto" 的代码，原汁原味使用用户的 APN 配置
+    let qnet_cmd = format!("AT+QNETDEVCTL={},1,1", profile_id);
+    let _ = at_client.send_command(qnet_cmd).await;
     
-    let apn_cmd = format!("AT+CGDCONT=1,\"{}\",\"auto\"", at_pdp_type);
-    let _ = at_client.send_command(apn_cmd).await;
-    let _ = at_client.send_command("AT+QNETDEVCTL=1,1,1".to_string()).await;
-    let _ = at_client.send_command("AT+CGACT=1,1".to_string()).await;
-    // Fallback for Fibocom FM350 and others using PDP 0
-    let _ = at_client.send_command("AT+CGACT=1,0".to_string()).await;
+    let cgact_cmd = format!("AT+CGACT={},1", profile_id);
+    let _ = at_client.send_command(cgact_cmd).await;
+
+    // 3. Fallback for Fibocom FM350 and others using PDP 0 (仅在 profile 1 时适用)
+    if profile_id == 1 {
+        let _ = at_client.send_command("AT+CGACT=1,0".to_string()).await;
+    }
     
     Ok(())
 }
