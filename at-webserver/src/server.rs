@@ -173,11 +173,32 @@ async fn handle_client(
                              continue;
                          }
 
-                         // 【复刻 Python】：放弃严格的 JSON 校验，直接将前端发来的文本作为指令！
-                         // 剥离可能存在的外部双引号，防止前端 JSON.stringify 污染指令
-                         let mut cmd_str = text.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
-                         if cmd_str.is_empty() { continue; }
-                         info!("WS Command: {}", cmd_str);
+                         // 3. 【终极容错解析】：智能判断并精准提取指令，绝不误伤指令自身的引号！
+                         let mut cmd_str = String::new();
+                         let text_trimmed = text.trim();
+                         
+                         // 尝试 1：当作完整的 JSON 对象解析 (比如 {"command": "AT+CFUN=0"})
+                         if text_trimmed.starts_with('{') {
+                             if let Ok(r) = serde_json::from_str::<WSCommand>(text_trimmed) {
+                                 cmd_str = r.command;
+                             }
+                         }
+                         
+                         if cmd_str.is_empty() {
+                             // 尝试 2：当作被 JSON.stringify 包装过的字符串解析 (完美处理转义符和外层引号)
+                             if let Ok(s) = serde_json::from_str::<String>(text_trimmed) {
+                                 cmd_str = s;
+                             } else {
+                                 // 尝试 3：纯得不能再纯的原始裸文本，直接用
+                                 cmd_str = text_trimmed.to_string();
+                             }
+                         }
+
+                         if cmd_str.is_empty() {
+                             continue;
+                         }
+
+                         log::info!("WS Command: {}", cmd_str);
 
                          if cmd_str.trim() == "AT+CONNECT?" {
                              let resp = WSResponse { success: true, data: Some("+CONNECT: 0\r\nOK".to_string()), error: None };
