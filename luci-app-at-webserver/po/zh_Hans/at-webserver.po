@@ -4,6 +4,12 @@ msgstr "Content-Type: text/plain; charset=UTF-8"
 msgid "AT WebServer"
 msgstr "AT WebServer"
 
+msgid "Modem"
+msgstr "调制解调器"
+
+msgid "模块管理面板"
+msgstr "模组管理面板"
+
 msgid "WebSocket服务器，用于通过Web界面管理AT命令。"
 msgstr "WebSocket服务器，用于通过Web界面管理AT命令。"
 
