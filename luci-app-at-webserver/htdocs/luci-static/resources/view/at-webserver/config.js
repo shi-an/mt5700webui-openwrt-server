@@ -341,17 +341,9 @@ return view.extend({
 		o = s.taboption('notify', form.Flag, 'sys_log_enable', _('启用系统日志'), _('记录系统运行日志'));
 		o.default = '1';
 
-		o = s.taboption('notify', form.Flag, 'sys_log_persist', _('持久化日志'), _('将日志保存到非易失存储（重启后保留）'));
+		o = s.taboption('notify', form.Flag, 'sys_log_persist', _('持久化日志'), _('将日志保存到非易失存储（重启后保留）。已启用写缓存(8KB/5秒)和日志轮转(1MB)以保护 Flash。'));
 		o.default = '0';
 		o.depends('sys_log_enable', '1');
-
-		o = s.taboption('notify', form.Value, 'sys_log_path_temp', _('临时日志路径'), _('临时日志文件路径（内存中）'));
-		o.default = '/tmp/at-webserver.log';
-		o.depends('sys_log_persist', '0');
-
-		o = s.taboption('notify', form.Value, 'sys_log_path_persist', _('持久日志路径'), _('持久化日志文件路径'));
-		o.default = '/etc/at-webserver.log';
-		o.depends('sys_log_persist', '1');
 
 		// ---------------------------------------------------------
 		// 事件通知触发条件
@@ -359,6 +351,13 @@ return view.extend({
 		o = s.taboption('notify', form.DummyValue, '_notify_title', _('事件通知触发'));
 		o.rawhtml = true;
 		o.cfgvalue = function() { return '<h3>' + _('短信与事件通知配置') + '</h3>'; };
+
+		o = s.taboption('notify', form.Flag, 'notify_log_enable', _('记录通知日志'), _('记录短信、来电等通知事件到日志文件'));
+		o.default = '1';
+
+		o = s.taboption('notify', form.Flag, 'notify_log_persist', _('持久化通知日志'), _('将通知日志保存到非易失存储。已启用写缓存(8KB/5秒)和日志轮转(1MB)。'));
+		o.default = '0';
+		o.depends('notify_log_enable', '1');
 
 		o = s.taboption('notify', form.Flag, 'notify_sms', _('短信通知'), _('接收到新短信时发送通知'));
 		o.default = '1';
@@ -370,15 +369,12 @@ return view.extend({
 		o.default = '1';
 
 		// 新增：短信转发后是否删除原短信
-		o = s.taboption('notify', form.Flag, 'sms_delete_after_forward', _('转发后删除短信'), _('启用后，只有当短信成功转发到第三方通道（如微信、钉钉等）后，才自动从存储中删除该短信。'));
+		o = s.taboption('notify', form.Flag, 'sms_delete_after_forward', _('第三方转发后删除短信'), _('启用后，只有当短信成功转发到第三方通道（如微信、钉钉等）后，才自动从 SIM 卡存储中删除该短信。WebSocket 实时推送不会触发删除。'));
 		o.default = '0';
 		o.depends('notify_sms', '1');
 
 		o = s.taboption('notify', form.Flag, 'notify_signal', _('信号变化通知'), _('网络信号强度变化或制式切换时发送通知'));
-		o.default = '1';
-
-		o = s.taboption('notify', form.Value, 'log_file', _('通知记录文件'), _('保存通知记录的日志文件路径，留空则不启用'));
-		o.placeholder = '/var/log/at-notifications.log';
+		o.default = '0';
 
 		// ---------------------------------------------------------
 		// 第三方推送通道 (修复 Bug：将原 MultiValue 改为独立开关)

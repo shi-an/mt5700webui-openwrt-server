@@ -17,8 +17,6 @@ pub struct Config {
 pub struct SysLogConfig {
     pub enable: bool,
     pub persist: bool,
-    pub path_temp: String,
-    pub path_persist: String,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +56,9 @@ pub struct NotificationConfig {
     pub tg_chat_id: Option<String>,
     pub generic_webhook_url: Option<String>,
     pub custom_script_path: Option<String>,
-    pub log_file: Option<String>,
+    // pub log_file: Option<String>, // Removed, using standard paths
+    pub notify_log_enable: bool,
+    pub notify_log_persist: bool,
     pub notify_sms: bool,
     pub notify_call: bool,
     pub notify_memory_full: bool,
@@ -156,7 +156,9 @@ impl Default for Config {
                 tg_chat_id: None,
                 generic_webhook_url: None,
                 custom_script_path: None,
-                log_file: None,
+                // log_file: None,
+                notify_log_enable: true,
+                notify_log_persist: false,
                 notify_sms: true,
                 notify_call: true,
                 notify_memory_full: true,
@@ -215,8 +217,6 @@ impl Default for Config {
             sys_log_config: SysLogConfig {
                 enable: true,
                 persist: false,
-                path_temp: "/tmp/at-webserver.log".to_string(),
-                path_persist: "/etc/at-webserver.log".to_string(),
             },
         }
     }
@@ -356,8 +356,10 @@ impl Config {
         let custom_script = get_str("custom_script_path", "");
         config.notification_config.custom_script_path = if custom_script.is_empty() { None } else { Some(custom_script) };
 
-        let log_file = get_str("log_file", "");
-        config.notification_config.log_file = if log_file.is_empty() { None } else { Some(log_file) };
+        // let log_file = get_str("log_file", "");
+        // config.notification_config.log_file = if log_file.is_empty() { None } else { Some(log_file) };
+        config.notification_config.notify_log_enable = get_bool("notify_log_enable", true);
+        config.notification_config.notify_log_persist = get_bool("notify_log_persist", false);
 
         config.notification_config.notify_sms = get_bool("notify_sms", true);
         config.notification_config.notify_call = get_bool("notify_call", true);
@@ -431,8 +433,8 @@ impl Config {
         // SysLog Config
         config.sys_log_config.enable = get_bool("sys_log_enable", true);
         config.sys_log_config.persist = get_bool("sys_log_persist", false);
-        config.sys_log_config.path_temp = get_str("sys_log_path_temp", "/tmp/at-webserver.log");
-        config.sys_log_config.path_persist = get_str("sys_log_path_persist", "/etc/at-webserver.log");
+        // config.sys_log_config.path_temp = get_str("sys_log_path_temp", "/tmp/at-webserver.log");
+        // config.sys_log_config.path_persist = get_str("sys_log_path_persist", "/etc/at-webserver.log");
 
         // Env var overrides (for local debugging)
         if let Ok(val) = std::env::var("AT_CONNECTION_TYPE") {
@@ -450,7 +452,7 @@ impl Config {
         if let Ok(val) = std::env::var("AT_SERIAL_BAUDRATE") { 
              if let Ok(b) = val.parse() { config.at_config.serial.baudrate = b; }
         }
-        if let Ok(val) = std::env::var("AT_LOG_FILE") { config.notification_config.log_file = Some(val); }
+        // if let Ok(val) = std::env::var("AT_LOG_FILE") { config.notification_config.log_file = Some(val); }
 
         info!("Loaded configuration: {:?}", config);
         config

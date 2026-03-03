@@ -39,11 +39,13 @@ config at-webserver 'config'
 	option tg_chat_id ''
 	option generic_webhook_url ''
 	option custom_script_path ''
-	option log_file ''
+	# option log_file ''
+	option notify_log_enable '1'
+	option notify_log_persist '0'
 	option notify_sms '1'
 	option notify_call '1'
 	option notify_memory_full '1'
-	option notify_signal '1'
+	option notify_signal '0'
 	option sms_delete_after_forward '0'     # 短信转发后是否删除原短信 (0=保留, 1=删除)
 	
 	# 定时锁频配置
@@ -90,6 +92,6 @@ config at-webserver 'config'
 	# 系统日志配置
 	option sys_log_enable '1'                  # 是否启用系统日志记录
 	option sys_log_persist '0'                 # 是否持久化保存 (0=临时目录, 1=持久目录)
-	option sys_log_path_temp '/tmp/at-webserver.log'    # 临时日志路径
-	option sys_log_path_persist '/etc/at-webserver.log' # 持久化日志路径
+	# option sys_log_path_temp '/tmp/at-webserver.log'    # 临时日志路径
+	# option sys_log_path_persist '/etc/at-webserver.log' # 持久化日志路径
 

@@ -1,12 +1,18 @@
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
-use tokio::io::AsyncWriteExt;
 use chrono::Local;
 use crate::config::Config;
+use std::sync::mpsc;
+use std::thread;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 
 static LOGGER: OnceLock<AppLogger> = OnceLock::new();
 static LOG_CHANNEL: OnceLock<broadcast::Sender<String>> = OnceLock::new();
+static FILE_CHANNEL: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 
 pub struct AppLogger;
 
@@ -23,9 +29,13 @@ impl Log for AppLogger {
             // Print to console (captured by procd/logread)
             println!("{}", log_msg);
 
-            // Send to broadcast channel
+            // Send to broadcast channel (for WebSocket)
             if let Some(tx) = LOG_CHANNEL.get() {
-                // Ignore error if no receivers
+                let _ = tx.send(log_msg.clone());
+            }
+
+            // Send to file writer thread
+            if let Some(tx) = FILE_CHANNEL.get() {
                 let _ = tx.send(log_msg);
             }
         }
@@ -43,42 +53,55 @@ pub fn init(config: &Config) -> broadcast::Receiver<String> {
     let logger = LOGGER.get_or_init(|| AppLogger);
     log::set_logger(logger).map(|()| log::set_max_level(LevelFilter::Info)).expect("Failed to set logger");
 
-    // Start background task if logging is enabled
+    // Start background thread if logging is enabled
     if config.sys_log_config.enable {
         let log_path = if config.sys_log_config.persist {
-            config.sys_log_config.path_persist.clone()
+            PathBuf::from("/var/log/at-webserver.log")
         } else {
-            config.sys_log_config.path_temp.clone()
+            PathBuf::from("/tmp/at-webserver.log")
         };
 
-        let mut rx_file = LOG_CHANNEL.get().unwrap().subscribe();
+        // Create directory if needed
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         
-        tokio::spawn(async move {
-            use tokio::fs::OpenOptions;
-            
-            // Ensure directory exists if needed? Usually /tmp or /etc exists.
-            
-            loop {
-                if let Ok(msg) = rx_file.recv().await {
-                    // Open file in append mode each time or keep open? 
-                    // Keeping open is better for performance, but reopening handles log rotation better if external tools rotate it.
-                    // For simplicity and robustness, we can try to keep it open or reopen on error.
-                    // Let's try to append simply.
-                    
-                    let result = async {
-                        let mut file = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path)
-                            .await?;
-                        file.write_all(msg.as_bytes()).await?;
-                        file.write_all(b"\n").await?;
-                        Ok::<(), std::io::Error>(())
-                    }.await;
+        // Create empty file if not exists
+        let _ = OpenOptions::new().create(true).write(true).open(&log_path);
 
-                    if let Err(e) = result {
-                        eprintln!("Failed to write to log file: {}", e);
+        let (tx, rx) = mpsc::channel::<String>();
+        FILE_CHANNEL.set(tx).expect("Failed to set file channel");
+
+        thread::spawn(move || {
+            let mut buffer = String::with_capacity(10240);
+            let mut last_flush = Instant::now();
+
+            loop {
+                // Try to receive a message with a short timeout to allow periodic flushing
+                if let Ok(msg) = rx.recv_timeout(Duration::from_millis(100)) {
+                    buffer.push_str(&msg);
+                    buffer.push('\n');
+                }
+
+                let should_flush = buffer.len() > 8192 || last_flush.elapsed() >= Duration::from_secs(5);
+                
+                if should_flush && !buffer.is_empty() {
+                    // Check rotation
+                    if let Ok(metadata) = fs::metadata(&log_path) {
+                        if metadata.len() > 1024 * 1024 {
+                            let mut bak_path = log_path.clone();
+                            bak_path.set_extension("log.bak");
+                            let _ = fs::rename(&log_path, bak_path);
+                        }
                     }
+
+                    // Write to file
+                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                        let _ = file.write_all(buffer.as_bytes());
+                    }
+                    
+                    buffer.clear();
+                    last_flush = Instant::now();
                 }
             }
         });

@@ -5,9 +5,11 @@ use log::{error, info, warn};
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::OpenOptions;
+use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use urlencoding::encode;
 
 #[derive(Debug, Clone)]
@@ -31,34 +33,79 @@ pub trait NotificationChannel: Send + Sync {
 }
 
 struct LogNotification {
-    log_file: PathBuf,
+    tx: mpsc::Sender<String>,
 }
 
 impl LogNotification {
-    fn new(log_file: String) -> Result<Self> {
-        let path = PathBuf::from(log_file);
-        if let Some(parent) = path.parent() {
+    fn new(persist: bool) -> Self {
+        let log_path = if persist {
+            PathBuf::from("/var/log/at-notifications.log")
+        } else {
+            PathBuf::from("/tmp/at-notifications.log")
+        };
+
+        if let Some(parent) = log_path.parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-                info!("Created log directory: {:?}", parent);
+                let _ = std::fs::create_dir_all(parent);
             }
         }
-        Ok(Self { log_file: path })
+
+        // Create empty file if not exists
+        let _ = std::fs::OpenOptions::new().create(true).write(true).open(&log_path);
+        info!("Notification logging enabled at: {:?}", log_path);
+
+        let (tx, mut rx) = mpsc::channel::<String>(100);
+        let path_clone = log_path.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = String::with_capacity(10240);
+            let mut interval = interval(Duration::from_secs(5));
+
+            loop {
+                tokio::select! {
+                    Some(msg) = rx.recv() => {
+                        buffer.push_str(&msg);
+                        if buffer.len() > 8192 {
+                            Self::flush(&path_clone, &mut buffer).await;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if !buffer.is_empty() {
+                            Self::flush(&path_clone, &mut buffer).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self { tx }
+    }
+
+    async fn flush(path: &PathBuf, buffer: &mut String) {
+        // Rotate if needed (1MB limit)
+        if let Ok(metadata) = fs::metadata(path).await {
+            if metadata.len() > 1024 * 1024 {
+                let mut bak_path = path.clone();
+                bak_path.set_extension("log.bak");
+                let _ = fs::rename(path, bak_path).await;
+            }
+        }
+
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path).await {
+            if let Err(e) = file.write_all(buffer.as_bytes()).await {
+                error!("Failed to write notification log: {}", e);
+            }
+        }
+        buffer.clear();
     }
 }
 
 #[async_trait]
 impl NotificationChannel for LogNotification {
     async fn send(&self, msg: &NotificationMessage) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file)
-            .await?;
-            
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let line = format!("[{}] [{:?}] {}: {}\n", timestamp, msg.notification_type, msg.sender, msg.content);
-        file.write_all(line.as_bytes()).await?;
+        let _ = self.tx.send(line).await;
         Ok(())
     }
 }
@@ -292,14 +339,9 @@ impl NotificationManager {
         let client = Client::new();
         
         // Initialize Log Notification
-        if let Some(log_file) = &config.log_file {
-             match LogNotification::new(log_file.clone()) {
-                 Ok(logger) => {
-                     channels.push(Box::new(logger));
-                     info!("Log notification enabled: {}", log_file);
-                 },
-                 Err(e) => error!("Failed to initialize log notification: {}", e),
-             }
+        if config.notify_log_enable {
+             let logger = LogNotification::new(config.notify_log_persist);
+             channels.push(Box::new(logger));
         }
         
         // Check enabled services

@@ -55,6 +55,6 @@ async fn main() {
         config.websocket_config.auth_key.clone(),
         at_client,
         log_rx,
-        config.sys_log_config.persist.then(|| config.sys_log_config.path_persist.clone()).unwrap_or(config.sys_log_config.path_temp.clone())
+        if config.sys_log_config.persist { "/var/log/at-webserver.log".to_string() } else { "/tmp/at-webserver.log".to_string() }
     ).await;
 }

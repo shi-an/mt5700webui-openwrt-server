@@ -240,7 +240,12 @@ async fn handle_client(
                          
                          if cmd_str.trim() == "GET_SYS_LOGS" {
                              let content = match tokio::fs::read_to_string(log_path.as_str()).await {
-                                 Ok(c) => c, Err(_) => "".to_string(),
+                                 Ok(c) => if c.is_empty() { 
+                                     "------ 暂无系统日志记录 ------".to_string() 
+                                 } else { 
+                                     c 
+                                 },
+                                 Err(_) => "------ 系统日志文件暂未生成 ------".to_string(),
                              };
                              let resp = WSResponse { success: true, data: Some(content), error: None };
                              let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
