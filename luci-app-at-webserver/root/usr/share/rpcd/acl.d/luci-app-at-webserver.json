@@ -17,7 +17,8 @@
 				"/tmp/*": [ "list", "read", "stat" ],
 				"/var/log/*": [ "list", "read", "stat" ],
 				"/www/cgi-bin/at-ws-info": [ "exec" ],
-				"/www/cgi-bin/at-log-clear": [ "exec" ]
+				"/www/cgi-bin/at-log-clear": [ "exec" ],
+				"/sbin/logread": [ "exec" ]
 			}
 		},
 		"write": {
