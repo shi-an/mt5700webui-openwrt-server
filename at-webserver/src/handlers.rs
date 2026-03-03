@@ -317,7 +317,26 @@ impl MessageHandler for PDCPDataHandler {
     }
 }
 
-pub struct NetworkSignalHandler;
+pub struct NetworkSignalHandler {
+    state: Mutex<SignalState>,
+}
+
+struct SignalState {
+    last_rsrp: Option<i32>,
+    last_sys_mode: Option<String>,
+}
+
+impl NetworkSignalHandler {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(SignalState {
+                last_rsrp: None,
+                last_sys_mode: None,
+            }),
+        }
+    }
+}
+
 #[async_trait]
 impl MessageHandler for NetworkSignalHandler {
     fn can_handle(&self, line: &str) -> bool {
@@ -325,71 +344,116 @@ impl MessageHandler for NetworkSignalHandler {
     }
     async fn handle(
         &self,
-        _line: &str,
+        line: &str,
         notifications: &NotificationManager,
         cmd_tx: &CommandSender,
     ) -> Result<()> {
-        // When signal changes, query detailed info
-        // Simple throttling could be added here
-        
-        let cmd = "AT^MONSC".to_string();
-        let (tx, rx) = oneshot::channel();
-        if let Err(_) = cmd_tx.send((cmd, tx)).await {
-            return Ok(());
+        let line = line.trim();
+        let mut current_rsrp = None;
+        let mut current_sys_mode = None;
+
+        // Parse initial signal info to decide if we need to query MONSC
+        if line.contains("^CERSSI:") {
+            // ^CERSSI: <...>,<rsrp>,<rsrq>,<sinr>
+            // Example parts length check based on Python logic
+            let replaced = line.replace("^CERSSI:", "");
+            let parts: Vec<&str> = replaced.split(',').map(|s| s.trim()).collect();
+            if parts.len() >= 19 {
+                if let Ok(rsrp) = parts[18].parse::<i32>() {
+                    current_rsrp = Some(rsrp);
+                    current_sys_mode = Some("4G/5G".to_string());
+                }
+            }
+        } else if line.contains("^HCSQ:") {
+            // ^HCSQ: "LTE",<rsrp>,<sinr>,<rsrq>
+            let replaced = line.replace("^HCSQ:", "");
+            let parts: Vec<&str> = replaced.split(',').map(|s| s.trim()).collect();
+            if parts.len() >= 4 {
+                let mode = parts[0].trim_matches('"').to_string();
+                if let Ok(rsrp_raw) = parts[1].parse::<i32>() {
+                    // Python: rsrp = -140 + rsrp_raw
+                    current_rsrp = Some(-140 + rsrp_raw);
+                    current_sys_mode = Some(mode);
+                }
+            }
         }
 
-        if let Ok(response) = rx.await {
-            if let Some(data) = response.data {
-                // Parse MONSC data
-                // ^MONSC: NR,51,633984,321,114,-85,-11,15,20,30
-                // ^MONSC: LTE,1,1300,210,123,-90,-10,20
-                
-                let mut message = String::new();
-                let mut _rat = "";
-                let mut rsrp = 0;
-                
-                let re_nr = RE_MONSC_NR.get_or_init(|| 
-                    Regex::new(r"\^MONSC: NR,(\d+),(\d+),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)").unwrap()
-                );
-                
-                let re_lte = RE_MONSC_LTE.get_or_init(||
-                    Regex::new(r"\^MONSC: LTE,(\d+),(\d+),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)").unwrap()
-                );
-
-                if let Some(caps) = re_nr.captures(&data) {
-                    _rat = "NR";
-                    let arfcn = caps.get(2).map_or("", |m| m.as_str());
-                    let pci = caps.get(3).map_or("", |m| m.as_str());
-                    rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-                    let rsrq = caps.get(6).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-                    let sinr = caps.get(7).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-                    
-                    message = format!(
-                        "📶 5G Signal Info\nRAT: NR\nARFCN: {}\nPCI: {}\nRSRP: {} dBm\nRSRQ: {} dB\nSINR: {} dB",
-                        arfcn, pci, rsrp, rsrq, sinr
-                    );
-                } else if let Some(caps) = re_lte.captures(&data) {
-                    _rat = "LTE";
-                    let arfcn = caps.get(2).map_or("", |m| m.as_str());
-                    let pci = caps.get(3).map_or("", |m| m.as_str());
-                    rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-                    let rsrq = caps.get(6).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-                    let rssi = caps.get(7).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-
-                    message = format!(
-                        "📶 4G Signal Info\nRAT: LTE\nARFCN: {}\nPCI: {}\nRSRP: {} dBm\nRSRQ: {} dB\nRSSI: {} dBm",
-                        arfcn, pci, rsrp, rsrq, rssi
-                    );
+        let mut should_notify = false;
+        {
+            let mut state = self.state.lock().unwrap();
+            
+            // Check if system mode changed
+            if current_sys_mode != state.last_sys_mode {
+                should_notify = true;
+            }
+            
+            // Check if RSRP changed significantly (threshold = 3 dBm to be less spammy than Python's 1)
+            if let (Some(curr), Some(last)) = (current_rsrp, state.last_rsrp) {
+                if (curr - last).abs() >= 3 {
+                    should_notify = true;
                 }
+            } else if current_rsrp.is_some() {
+                should_notify = true;
+            }
 
-                if !message.is_empty() {
-                    // TODO: Logic to check thresholds and previous state to avoid spam
-                    // For now, we assume this handler is called only on significant changes or periodically
-                    // In a real implementation, we would need state persistence like `last_signal_data`
+            if should_notify {
+                state.last_rsrp = current_rsrp;
+                state.last_sys_mode = current_sys_mode.clone();
+            }
+        }
+
+        if should_notify {
+            // Query detailed info
+            let cmd = "AT^MONSC".to_string();
+            let (tx, rx) = oneshot::channel();
+            if let Err(_) = cmd_tx.send((cmd, tx)).await {
+                return Ok(());
+            }
+
+            if let Ok(response) = rx.await {
+                if let Some(data) = response.data {
+                    let mut message = String::new();
                     
-                    // Only notify if signal is very poor or excellent as an example
-                    if rsrp < -110 || rsrp > -60 {
-                         notifications.notify("Signal Monitor", &message, NotificationType::Signal).await;
+                    let re_nr = RE_MONSC_NR.get_or_init(|| 
+                        Regex::new(r"\^MONSC: NR,(\d+),(\d+),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)").unwrap()
+                    );
+                    
+                    let re_lte = RE_MONSC_LTE.get_or_init(||
+                        Regex::new(r"\^MONSC: LTE,(\d+),(\d+),(\d+),(\d+),(-?\d+),(-?\d+),(-?\d+)").unwrap()
+                    );
+
+                    if let Some(caps) = re_nr.captures(&data) {
+                        let arfcn = caps.get(2).map_or("", |m| m.as_str());
+                        let pci = caps.get(3).map_or("", |m| m.as_str());
+                        let rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+                        let rsrq = caps.get(6).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+                        let sinr = caps.get(7).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+                        
+                        let level = if rsrp >= -85 { "优秀" } else if rsrp >= -95 { "良好" } else if rsrp >= -105 { "一般" } else { "较差" };
+
+                        message = format!(
+                            "📶 5G 信号变动\n时间: {}\n信号质量: {}\nRSRP: {} dBm\nRSRQ: {} dB\nSINR: {} dB\n\n📡 小区信息:\n频点: {}\nPCI: {}",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                            level, rsrp, rsrq, sinr, arfcn, pci
+                        );
+                    } else if let Some(caps) = re_lte.captures(&data) {
+                        let arfcn = caps.get(2).map_or("", |m| m.as_str());
+                        let pci = caps.get(3).map_or("", |m| m.as_str());
+                        let rsrp = caps.get(5).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+                        let rsrq = caps.get(6).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+                        let rssi = caps.get(7).map_or(0, |m| m.as_str().parse().unwrap_or(0));
+
+                        let level = if rsrp >= -85 { "优秀" } else if rsrp >= -95 { "良好" } else if rsrp >= -105 { "一般" } else { "较差" };
+
+                        message = format!(
+                            "📶 4G 信号变动\n时间: {}\n信号质量: {}\nRSRP: {} dBm\nRSRQ: {} dB\nRSSI: {} dBm\n\n📡 小区信息:\n频点: {}\nPCI: {}",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                            level, rsrp, rsrq, rssi, arfcn, pci
+                        );
+                    }
+
+                    if !message.is_empty() {
+                        notifications.notify("信号监控", &message, NotificationType::Signal).await;
                     }
                 }
             }

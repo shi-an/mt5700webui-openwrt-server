@@ -70,7 +70,7 @@ impl ATClientActor {
                 Box::new(MemoryFullHandler),
                 Box::new(NewSMSHandler),
                 Box::new(PDCPDataHandler),
-                Box::new(NetworkSignalHandler),
+                Box::new(NetworkSignalHandler::new()),
             ];
             while let Some(line) = urc_rx.recv().await {
                 for handler in &mut async_handlers {
@@ -86,7 +86,7 @@ impl ATClientActor {
             Box::new(MemoryFullHandler),
             Box::new(NewSMSHandler),
             Box::new(PDCPDataHandler),
-            Box::new(NetworkSignalHandler),
+            Box::new(NetworkSignalHandler::new()),
         ];
 
         Self {
