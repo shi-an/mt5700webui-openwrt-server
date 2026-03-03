@@ -116,9 +116,8 @@ return view.extend({
 			E('div', { 'class': 'cbi-section-descr' }, _('查看 AT WebServer 插件的底层运行状态，日志每 3 秒自动更新。'))
 		]);
 
-		// 系统日志专属样式：黑色背景，绿色字体（极客终端风）
 		var sysLogPre = E('pre', {
-			'style': 'background:#000000; color:#00ff00; border:1px solid #333; padding:15px; border-radius:4px; height:500px; overflow-y:auto; font-family:monospace; font-size:13px; line-height:1.6; white-space: pre-wrap; word-wrap: break-word;'
+			'style': 'background:#000000; color:#ffffff; border:1px solid #333; padding:15px; border-radius:4px; height:500px; overflow-y:auto; font-family:monospace; font-size:13px; line-height:1.6; white-space: pre-wrap; word-wrap: break-word;'
 		}, _('等待获取系统日志...'));
 
 		var isAutoScroll = true;
