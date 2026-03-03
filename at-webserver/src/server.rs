@@ -4,12 +4,16 @@ use log::{error, info, debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+use std::net::SocketAddr;
 use tokio::sync::{oneshot, broadcast};
 use tokio::time::{timeout, Duration};
 use warp::Filter;
 use std::sync::OnceLock;
 
 pub static WS_BROADCASTER: OnceLock<broadcast::Sender<String>> = OnceLock::new();
+pub static CLIENT_CONNECTIONS: OnceLock<Mutex<HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<warp::ws::Message>>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct WSCommand {
@@ -38,6 +42,7 @@ pub async fn start_server(
 ) {
     let (ws_tx, _) = broadcast::channel(100);
     let _ = WS_BROADCASTER.set(ws_tx.clone());
+    let _ = CLIENT_CONNECTIONS.set(Mutex::new(HashMap::new()));
 
     let at_client = Arc::new(at_client);
     let auth_key = Arc::new(auth_key);
@@ -51,12 +56,13 @@ pub async fn start_server(
 
     let routes = warp::path::end()
         .and(warp::ws())
+        .and(warp::addr::remote())
         .and(at_client_filter)
         .and(auth_key_filter)
         .and(log_rx_filter)
         .and(log_path_filter)
-        .map(|ws: warp::ws::Ws, client, key, rx, path| {
-            ws.on_upgrade(move |socket| handle_client(socket, client, key, rx, path))
+        .map(|ws: warp::ws::Ws, addr: Option<SocketAddr>, client, key, rx, path| {
+            ws.on_upgrade(move |socket| handle_client(socket, addr, client, key, rx, path))
         });
 
     info!("Starting WebSocket server on [::]:{} (Dual-stack IPv4 & IPv6)", ipv6_port);
@@ -65,6 +71,7 @@ pub async fn start_server(
 
 async fn handle_client(
     mut ws: warp::ws::WebSocket,
+    addr: Option<SocketAddr>,
     at_client: Arc<ATClient>,
     auth_key: Arc<Option<String>>,
     log_rx: Arc<broadcast::Receiver<String>>,
@@ -131,6 +138,20 @@ async fn handle_client(
     // 【步骤1】：新增一个专门用于异步接收后台 AT 指令结果的通道
     let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<String>(32);
 
+    // Highlander Rule: Kick old connections from same IP
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<warp::ws::Message>();
+    let cmd_tx_cleanup = cmd_tx.clone();
+    if let Some(client_addr) = addr {
+        if let Some(conns) = CLIENT_CONNECTIONS.get() {
+            let mut conns = conns.lock().await;
+            if let Some(old_tx) = conns.remove(&client_addr) {
+                warn!("Detected new connection from {}, kicking old connection", client_addr);
+                let _ = old_tx.send(warp::ws::Message::close());
+            }
+            conns.insert(client_addr, cmd_tx);
+        }
+    }
+
     // Start heartbeat loop (optional, but good for keepalive)
     // For warp/tungstenite, ping/pong is handled automatically at protocol level usually,
     // but python version sends 'ping' text. We can implement similar logic if needed.
@@ -149,6 +170,17 @@ async fn handle_client(
             Some(resp_str) = conn_rx.recv() => {
                  if let Err(e) = tx.send(warp::ws::Message::text(resp_str)).await {
                      log::debug!("Failed to send async response to WS: {}", e);
+                     break;
+                 }
+            }
+            // Highlander Rule: Handle commands (like kick)
+            Some(msg) = cmd_rx.recv() => {
+                 let is_close = msg.is_close();
+                 if let Err(e) = tx.send(msg).await {
+                     log::debug!("Failed to send command to WS: {}", e);
+                     break;
+                 }
+                 if is_close {
                      break;
                  }
             }
@@ -288,4 +320,14 @@ async fn handle_client(
         }
     }
     info!("WebSocket client disconnected");
+    if let Some(client_addr) = addr {
+        if let Some(conns) = CLIENT_CONNECTIONS.get() {
+            let mut conns = conns.lock().await;
+            if let Some(sender) = conns.get(&client_addr) {
+                if sender.same_channel(&cmd_tx_cleanup) {
+                    conns.remove(&client_addr);
+                }
+            }
+        }
+    }
 }

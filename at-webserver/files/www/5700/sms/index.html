@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html>
-<head>
+<head><script>const OrigWS=window.WebSocket;window.WebSocket=function(...args){const ws=new OrigWS(...args);const origSend=ws.send;ws.send=function(data){if(data==="ping"||data==="\"ping\""){return origSend.apply(this,arguments);}let t=setTimeout(()=>{console.warn("WS指令超时,强制熔断防卡死!");ws.close();},8000);ws.addEventListener("message",()=>clearTimeout(t),{once:true});return origSend.apply(this,arguments);};return ws;};</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
 <meta http-equiv="X-UA-Compatible" content="ie=edge">
