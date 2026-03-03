@@ -14,10 +14,8 @@
 				"/etc/config/at-webserver": [ "read", "stat" ],
 				"/etc/config/firewall": [ "read", "stat" ],
 				"/etc/init.d/at-webserver": [ "list", "read", "stat", "exec" ],
-				"/tmp/at-notifications.log": [ "read", "stat" ],
-				"/var/log/at-notifications.log": [ "read", "stat" ],
-				"/tmp/*": [ "list" ],
-				"/var/log/*": [ "list" ],
+				"/tmp/*": [ "list", "read", "stat" ],
+				"/var/log/*": [ "list", "read", "stat" ],
 				"/www/cgi-bin/at-ws-info": [ "exec" ],
 				"/www/cgi-bin/at-log-clear": [ "exec" ]
 			}
@@ -34,10 +32,9 @@
 				"/etc/config/at-webserver": [ "write", "read", "stat" ],
 				"/etc/config/firewall": [ "write", "read", "stat" ],
 				"/etc/init.d/at-webserver": [ "exec" ],
-				"/tmp/at-notifications.log": [ "write", "read", "stat" ],
-				"/var/log/at-notifications.log": [ "write", "read", "stat" ]
+				"/tmp/*": [ "write", "read", "stat" ],
+				"/var/log/*": [ "write", "read", "stat" ]
 			}
 		}
 	}
 }
-
