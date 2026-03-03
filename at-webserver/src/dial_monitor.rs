@@ -48,9 +48,28 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         is_connected = false;
                     }
                     
-                    info!("No IP address detected. Attempting to dial...");
-                    if let Err(e) = perform_dial(&config, &at_client).await {
-                        warn!("Dial attempt failed: {}", e);
+                    info!("No IP address detected. Checking auto-dial setting before attempting to dial...");
+                    
+                    // 1. 先查询模块当前的自动拨号设置
+                    let auto_dial_resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
+                    
+                    let mut should_dial = true; // 默认去拨号
+                    
+                    if let Ok(resp) = auto_dial_resp {
+                        if let Some(data) = resp.data {
+                            // 2. 如果返回包含 ^SETAUTODIAL:0，说明用户在网页上手动关闭了拨号
+                            if data.contains("^SETAUTODIAL:0") || data.contains("^SETAUTODIAL: 0") {
+                                warn!("Auto-dial is DISABLED in modem settings. Rust backend will NOT force dial.");
+                                should_dial = false;
+                            }
+                        }
+                    }
+
+                    // 3. 只有在允许拨号的情况下，才执行强行抢救
+                    if should_dial {
+                        if let Err(e) = perform_dial(&config, &at_client).await {
+                            warn!("Dial attempt failed: {}", e);
+                        }
                     }
                 }
             }
