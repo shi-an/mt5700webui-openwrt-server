@@ -245,12 +245,11 @@ impl ATClientActor {
             ""
         };
 
-        // 3. 发射指令（附带防死锁反馈机制）
+        // 3. 发射指令（严格对齐 Python 原版，只能发送 \r，绝对不能有 \n！）
         if let Err(e) = conn.send(clean_cmd.as_bytes()).await {
              let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
              return Ok(());
         }
-        // 【核心致命修复】：5G 模块 AT 指令只能以 \r 结尾。绝对不能发送 \n，否则会引发模块“空指令 ERROR 抢答”，导致所有的耗时设置全军覆没！
         if let Err(e) = conn.send(b"\r").await {
              let _ = reply_tx.send(ATResponse::error(format!("Send failed: {}", e)));
              return Ok(());
