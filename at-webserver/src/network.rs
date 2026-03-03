@@ -20,6 +20,8 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
         uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
         uci_batch.push_str("set network.wan_modem.metric='10'\n");
+        // 【新增】极其重要！强制允许该物理接口接收 IPv6 报文(RA)
+        uci_batch.push_str("set network.wan_modem.ipv6='1'\n");
         
         if !net_config.dns_list.is_empty() {
             uci_batch.push_str("set network.wan_modem.peerdns='0'\n");
@@ -39,8 +41,10 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         uci_batch.push_str("set network.wan_modem6.metric='10'\n");
         
         // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
-        uci_batch.push_str("set network.wan_modem6.reqaddress='force'\n");
+        uci_batch.push_str("set network.wan_modem6.reqaddress='try'\n");
         uci_batch.push_str("set network.wan_modem6.reqprefix='auto'\n");
+        uci_batch.push_str("set network.wan_modem6.norelease='1'\n");
+        uci_batch.push_str("set network.wan_modem6.auto='1'\n");
         
         // 【核心修复3】：要求强制将获取到的 5G 前缀扩展委派给内网 (LAN)
         uci_batch.push_str("set network.wan_modem6.extendprefix='1'\n");
@@ -74,6 +78,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     info!("Bringing up interfaces and reloading firewall...");
     let _ = run_command("ifup", &["wan_modem"]).await;
     if pdp_type.contains("ipv6") {
+        info!("Bringing up wan_modem6 (IPv6)...");
         let _ = run_command("ifup", &["wan_modem6"]).await;
     }
     
