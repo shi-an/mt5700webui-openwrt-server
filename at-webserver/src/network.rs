@@ -33,7 +33,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
         }
     }
 
-    if pdp_type.contains("ipv6") {
+    if pdp_type.contains("v6") {
         uci_batch.push_str("set network.wan_modem6=interface\n");
         uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
         // 使用物理接口而不是逻辑别名，提高兼容性
@@ -77,7 +77,7 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
 
     info!("Bringing up interfaces and reloading firewall...");
     let _ = run_command("ifup", &["wan_modem"]).await;
-    if pdp_type.contains("ipv6") {
+    if pdp_type.contains("v6") {
         info!("Bringing up wan_modem6 (IPv6)...");
         let _ = run_command("ifup", &["wan_modem6"]).await;
     }
