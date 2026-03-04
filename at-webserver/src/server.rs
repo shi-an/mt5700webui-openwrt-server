@@ -13,7 +13,7 @@ use warp::Filter;
 use std::sync::OnceLock;
 
 pub static WS_BROADCASTER: OnceLock<broadcast::Sender<String>> = OnceLock::new();
-pub static CLIENT_CONNECTIONS: OnceLock<Mutex<HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<warp::ws::Message>>>> = OnceLock::new();
+pub static CLIENT_CONNECTIONS: OnceLock<Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::UnboundedSender<warp::ws::Message>>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct WSCommand {
@@ -141,14 +141,18 @@ async fn handle_client(
     // Highlander Rule: Kick old connections from same IP
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<warp::ws::Message>();
     let cmd_tx_cleanup = cmd_tx.clone();
-    if let Some(client_addr) = addr {
+    
+    // 【修改核心】：提取纯 IP 地址，抛弃随机端口
+    let client_ip = addr.map(|a| a.ip());
+
+    if let Some(ip) = client_ip {
         if let Some(conns) = CLIENT_CONNECTIONS.get() {
             let mut conns = conns.lock().await;
-            if let Some(old_tx) = conns.remove(&client_addr) {
-                warn!("Detected new connection from {}, kicking old connection", client_addr);
+            if let Some(old_tx) = conns.remove(&ip) {
+                warn!("Detected new connection from IP {}, kicking old connection (防死链生效)", ip);
                 let _ = old_tx.send(warp::ws::Message::close());
             }
-            conns.insert(client_addr, cmd_tx);
+            conns.insert(ip, cmd_tx);
         }
     }
 
@@ -231,6 +235,12 @@ async fn handle_client(
                          }
 
                          log::info!("WS Command: {}", cmd_str);
+
+                         // 【新增】：哪怕前端包装成 JSON，只要解析出来是 ping，直接秒回 pong，绝不麻烦硬件！
+                         if cmd_str.trim() == "ping" || cmd_str.trim().to_lowercase() == "keepalive" {
+                             let _ = tx.send(warp::ws::Message::text("pong")).await;
+                             continue;
+                         }
 
                          if cmd_str.trim() == "AT+CONNECT?" {
                              let resp = WSResponse { success: true, data: Some("+CONNECT: 0\r\nOK".to_string()), error: None };
@@ -325,12 +335,12 @@ async fn handle_client(
         }
     }
     info!("WebSocket client disconnected");
-    if let Some(client_addr) = addr {
+    if let Some(ip) = client_ip {
         if let Some(conns) = CLIENT_CONNECTIONS.get() {
             let mut conns = conns.lock().await;
-            if let Some(sender) = conns.get(&client_addr) {
+            if let Some(sender) = conns.get(&ip) {
                 if sender.same_channel(&cmd_tx_cleanup) {
-                    conns.remove(&client_addr);
+                    conns.remove(&ip);
                 }
             }
         }
