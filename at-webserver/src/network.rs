@@ -14,6 +14,12 @@ pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
     let mut uci_batch = String::new();
     uci_batch.push_str("delete network.wan_modem\n");
     uci_batch.push_str("delete network.wan_modem6\n");
+    // 【新增】: 顺便清理可能残留的设备配置
+    uci_batch.push_str(&format!("delete network.dev_{}\n", ifname));
+
+    // 【新增核心代码】：显式向系统注册 5G 模块的物理设备，强制 UI 识别
+    uci_batch.push_str(&format!("set network.dev_{}=device\n", ifname));
+    uci_batch.push_str(&format!("set network.dev_{}.name='{}'\n", ifname, ifname));
 
     if pdp_type.contains("ipv4") {
         uci_batch.push_str("set network.wan_modem=interface\n");
