@@ -24,10 +24,14 @@ async fn main() {
         std::env::set_var("RUST_LOG", "info");
     }
     
+
     let config = Config::load();
     let log_rx = syslog::init(&config);
     
     info!("Starting AT Webserver (Rust Version)...");
+    
+    // 【新增】启动时先执行一次彻底的网络环境清理
+    let _ = network::clean_startup_state().await;
     
     let notifications = NotificationManager::new(config.notification_config.clone());
     

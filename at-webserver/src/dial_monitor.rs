@@ -2,50 +2,88 @@ use crate::client::ATClient;
 use crate::config::Config;
 use crate::network;
 use log::{info, warn, error, debug};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
+use tokio::process::Command;
 use anyhow::Result;
 
 use tokio::fs;
 
+enum ConnectionState {
+    Disconnected,
+    IPv4Configured(Instant),
+    FullStackConfigured,
+}
+
 pub async fn start_monitor(config: Config, at_client: ATClient) {
-    info!("Starting dial monitor...");
+    info!("Starting dial monitor with Delayed IPv6 Injection...");
     
-    // Track connection state to avoid repeated setup
-    let mut is_connected = false;
+    // Track connection state
+    let mut state = ConnectionState::Disconnected;
 
     loop {
         // Check IP status
         match check_ip_status(&at_client).await {
             Ok(has_ip) => {
                 if has_ip {
-                    if !is_connected {
-                        info!("IP address detected. Marking as connected.");
-                        is_connected = true;
-                        
-                        info!("Initializing modem URC reporting configs...");
-                        let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
-                        let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
-                        let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
+                    match state {
+                        ConnectionState::Disconnected => {
+                            info!("IP address detected. Starting IPv4 setup...");
+                            
+                            info!("Initializing modem URC reporting configs...");
+                            let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
+                            let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
+                            let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
 
-                        // Detect interface
-                        let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
-                        info!("Auto-detected 5G interface: {}", actual_ifname);
-                        
-                        // Execute network setup script
-                        if let Err(e) = network::setup_modem_network(&config, &actual_ifname).await {
-                            error!("Failed to setup modem network: {}", e);
-                            // We don't set is_connected to false here, to avoid retrying setup immediately 
-                            // unless we lose IP. But maybe we should? 
-                            // For now, assume setup failure might be transient or partial, 
-                            // and we will retry only if we lose IP and regain it, or we could retry logic.
-                            // But requirements say "If ... new connection state ... call setup".
+                            // Detect interface
+                            let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
+                            info!("Auto-detected 5G interface: {}", actual_ifname);
+                            
+                            // Setup IPv4 Only
+                            if let Err(e) = network::setup_ipv4_only(&config, &actual_ifname).await {
+                                error!("Failed to setup IPv4 network: {}", e);
+                            } else {
+                                state = ConnectionState::IPv4Configured(Instant::now());
+                                info!("IPv4 setup done. Waiting for stability before injecting IPv6...");
+                            }
+                        },
+                        ConnectionState::IPv4Configured(start_time) => {
+                            // Check config to see if IPv6 is even enabled
+                            let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
+                            let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
+                            
+                            if !ipv6_needed {
+                                state = ConnectionState::FullStackConfigured;
+                                continue;
+                            }
+
+                            // Wait for 15 seconds
+                            if start_time.elapsed().as_secs() >= 15 {
+                                // Check Ping
+                                if check_ping().await {
+                                    info!("IPv4 network is stable (Ping success). Injecting IPv6...");
+                                    let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
+                                    
+                                    if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
+                                        error!("Failed to inject IPv6 interface: {}", e);
+                                    } else {
+                                        state = ConnectionState::FullStackConfigured;
+                                        info!("IPv6 Injection Completed. Full stack active.");
+                                    }
+                                } else {
+                                    debug!("IPv4 configured but ping failed/unstable. Holding IPv6 injection...");
+                                }
+                            }
+                        },
+                        ConnectionState::FullStackConfigured => {
+                            // Monitoring stable state
                         }
                     }
                 } else {
-                    if is_connected {
-                        warn!("Lost IP address. Marking as disconnected.");
-                        is_connected = false;
+                    // No IP detected
+                    if !matches!(state, ConnectionState::Disconnected) {
+                        warn!("Lost IP address. Resetting connection state.");
+                        state = ConnectionState::Disconnected;
                     }
                     
                     info!("No IP address detected. Checking auto-dial setting before attempting to dial...");
@@ -79,6 +117,28 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
         }
 
         sleep(Duration::from_secs(10)).await;
+    }
+}
+
+async fn check_ping() -> bool {
+    // Ping Aliyun DNS (223.5.5.5) or 114 DNS
+    // -c 1: count 1
+    // -W 2: timeout 2 seconds
+    let output = Command::new("ping")
+        .args(&["-c", "1", "-W", "2", "223.5.5.5"])
+        .output()
+        .await;
+        
+    match output {
+        Ok(o) => if o.status.success() { return true; } else {
+             // Fallback to 114.114.114.114
+             let output2 = Command::new("ping")
+                .args(&["-c", "1", "-W", "2", "114.114.114.114"])
+                .output()
+                .await;
+             return output2.map(|o| o.status.success()).unwrap_or(false);
+        },
+        Err(_) => false,
     }
 }
 
