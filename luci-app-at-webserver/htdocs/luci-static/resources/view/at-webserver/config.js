@@ -193,7 +193,7 @@ return view.extend({
 		
 		o = s.taboption('network', form.ListValue, 'pdp_type', _('PDP 类型'), _('选择拨号协议类型'));
 		o.value('ipv4', 'IPv4 Only');
-		o.value('ipv6', 'IPv6 Only');
+		// o.value('ipv6', 'IPv6 Only');
 		o.value('ipv4v6', 'IPv4 + IPv6');
 		o.default = 'ipv4v6';
 		
