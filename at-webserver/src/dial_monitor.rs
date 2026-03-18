@@ -2,7 +2,7 @@ use crate::client::ATClient;
 use crate::config::Config;
 use crate::network;
 use log::{info, warn, error, debug};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::sleep;
 use tokio::process::Command;
 use anyhow::Result;
@@ -11,12 +11,11 @@ use tokio::fs;
 
 enum ConnectionState {
     Disconnected,
-    IPv4Configured(Instant),
     FullStackConfigured,
 }
 
 pub async fn start_monitor(config: Config, at_client: ATClient) {
-    info!("Starting dial monitor with Delayed IPv6 Injection and Disaster Recovery...");
+    info!("Starting dial monitor with Disaster Recovery...");
     
     // Track connection state
     let mut state = ConnectionState::Disconnected;
@@ -29,7 +28,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 if has_ip {
                     match state {
                         ConnectionState::Disconnected => {
-                            info!("IP address detected. Starting IPv4 setup...");
+                            info!("IP address detected. Starting network setup...");
                             
                             info!("Initializing modem URC reporting configs...");
                             let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
@@ -40,51 +39,29 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
                             info!("Auto-detected 5G interface: {}", actual_ifname);
                             
-                            // Setup IPv4 Only
+                            // Setup IPv4
                             if let Err(e) = network::setup_ipv4_only(&config, &actual_ifname).await {
                                 error!("Failed to setup IPv4 network: {}", e);
                             } else {
-                                state = ConnectionState::IPv4Configured(Instant::now());
-                                ping_fail_count = 0;
-                                info!("IPv4 setup done. Waiting for stability before injecting IPv6...");
+                                info!("IPv4 setup done.");
                             }
-                        },
-                        ConnectionState::IPv4Configured(start_time) => {
-                            // Check config to see if IPv6 is even enabled
+                            
+                            // Check config to see if IPv6 is enabled and setup
                             let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
                             let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
                             
-                            if !ipv6_needed {
-                                state = ConnectionState::FullStackConfigured;
-                                continue;
-                            }
-
-                            // Wait for 15 seconds
-                            if start_time.elapsed().as_secs() >= 15 {
-                                // Check Ping
-                                if check_ping().await {
-                                    ping_fail_count = 0;
-                                    info!("IPv4 network is stable (Ping success). Injecting IPv6...");
-                                    let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
-                                    
-                                    if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
-                                        error!("Failed to inject IPv6 interface: {}", e);
-                                    } else {
-                                        state = ConnectionState::FullStackConfigured;
-                                        info!("IPv6 Injection Completed. Full stack active.");
-                                    }
+                            if ipv6_needed {
+                                info!("IPv6 is enabled. Injecting IPv6 interface...");
+                                if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
+                                    error!("Failed to inject IPv6 interface: {}", e);
                                 } else {
-                                    ping_fail_count += 1;
-                                    warn!("IPv4 configured but ping failed. Count: {}/3", ping_fail_count);
-                                    if ping_fail_count >= 3 {
-                                        warn!("Continuous 3 ping failures detected! Triggering disaster recovery.");
-                                        trigger_disaster_recovery(&config, &at_client).await;
-                                        ping_fail_count = 0;
-                                        state = ConnectionState::Disconnected;
-                                        continue;
-                                    }
+                                    info!("IPv6 Injection Completed.");
                                 }
                             }
+                            
+                            state = ConnectionState::FullStackConfigured;
+                            ping_fail_count = 0;
+                            info!("Network setup complete. Full stack active.");
                         },
                         ConnectionState::FullStackConfigured => {
                             // Monitoring stable state by occasionally pinging
