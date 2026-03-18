@@ -16,10 +16,11 @@ enum ConnectionState {
 }
 
 pub async fn start_monitor(config: Config, at_client: ATClient) {
-    info!("Starting dial monitor with Delayed IPv6 Injection...");
+    info!("Starting dial monitor with Delayed IPv6 Injection and Disaster Recovery...");
     
     // Track connection state
     let mut state = ConnectionState::Disconnected;
+    let mut ping_fail_count = 0;
 
     loop {
         // Check IP status
@@ -44,6 +45,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 error!("Failed to setup IPv4 network: {}", e);
                             } else {
                                 state = ConnectionState::IPv4Configured(Instant::now());
+                                ping_fail_count = 0;
                                 info!("IPv4 setup done. Waiting for stability before injecting IPv6...");
                             }
                         },
@@ -61,6 +63,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             if start_time.elapsed().as_secs() >= 15 {
                                 // Check Ping
                                 if check_ping().await {
+                                    ping_fail_count = 0;
                                     info!("IPv4 network is stable (Ping success). Injecting IPv6...");
                                     let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
                                     
@@ -71,44 +74,50 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                         info!("IPv6 Injection Completed. Full stack active.");
                                     }
                                 } else {
-                                    debug!("IPv4 configured but ping failed/unstable. Holding IPv6 injection...");
+                                    ping_fail_count += 1;
+                                    warn!("IPv4 configured but ping failed. Count: {}/3", ping_fail_count);
+                                    if ping_fail_count >= 3 {
+                                        warn!("Continuous 3 ping failures detected! Triggering disaster recovery.");
+                                        trigger_disaster_recovery(&config, &at_client).await;
+                                        ping_fail_count = 0;
+                                        state = ConnectionState::Disconnected;
+                                        continue;
+                                    }
                                 }
                             }
                         },
                         ConnectionState::FullStackConfigured => {
-                            // Monitoring stable state
-                        }
-                    }
-                } else {
-                    // No IP detected
-                    if !matches!(state, ConnectionState::Disconnected) {
-                        warn!("Lost IP address. Resetting connection state.");
-                        state = ConnectionState::Disconnected;
-                    }
-                    
-                    info!("No IP address detected. Checking auto-dial setting before attempting to dial...");
-                    
-                    // 1. 先查询模块当前的自动拨号设置
-                    let auto_dial_resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
-                    
-                    let mut should_dial = true; // 默认去拨号
-                    
-                    if let Ok(resp) = auto_dial_resp {
-                        if let Some(data) = resp.data {
-                            // 2. 如果返回包含 ^SETAUTODIAL:0，说明用户在网页上手动关闭了拨号
-                            if data.contains("^SETAUTODIAL:0") || data.contains("^SETAUTODIAL: 0") {
-                                warn!("Auto-dial is DISABLED in modem settings. Rust backend will NOT force dial.");
-                                should_dial = false;
+                            // Monitoring stable state by occasionally pinging
+                            if !check_ping().await {
+                                ping_fail_count += 1;
+                                warn!("Ping failed in stable state. Count: {}/3", ping_fail_count);
+                                if ping_fail_count >= 3 {
+                                    warn!("Continuous 3 ping failures detected! Triggering disaster recovery.");
+                                    trigger_disaster_recovery(&config, &at_client).await;
+                                    ping_fail_count = 0;
+                                    state = ConnectionState::Disconnected;
+                                    continue;
+                                }
+                            } else {
+                                if ping_fail_count > 0 {
+                                    info!("Ping recovered. Resetting failure count.");
+                                    ping_fail_count = 0;
+                                }
                             }
                         }
                     }
-
-                    // 3. 只有在允许拨号的情况下，才执行强行抢救
-                    if should_dial {
-                        if let Err(e) = perform_dial(&config, &at_client).await {
-                            warn!("Dial attempt failed: {}", e);
-                        }
+                } else {
+                    // No IP detected (Link is down)
+                    if !matches!(state, ConnectionState::Disconnected) {
+                        warn!("Lost IP address (Link is down). Resetting connection state and triggering disaster recovery.");
+                        state = ConnectionState::Disconnected;
+                    } else {
+                        warn!("No IP address detected (Link is down). Triggering disaster recovery.");
                     }
+                    
+                    trigger_disaster_recovery(&config, &at_client).await;
+                    ping_fail_count = 0;
+                    state = ConnectionState::Disconnected;
                 }
             }
             Err(e) => {
@@ -267,6 +276,83 @@ async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
+    info!("=== Phase 1: Disaster Recovery (Soft SIM Plug/Unplug) ===");
+    // 1. 强制去激活 SIM 卡 (拔卡)
+    let _ = at_client.send_command("AT^HVSST=1,0".to_string()).await;
+    
+    // 2. 等待基带彻底释放资源
+    sleep(Duration::from_secs(3)).await;
+    
+    // 3. 重新激活 SIM 卡 (插卡)
+    let _ = at_client.send_command("AT^HVSST=1,1".to_string()).await;
+    
+    // 4. 循环等待直到模组返回 "+CPIN: READY"
+    wait_for_cpin_ready(at_client).await;
+
+    info!("=== Phase 2: Configuration & Activation (Dial) ===");
+    // Check if auto dial is enabled first to respect user config
+    let auto_dial_resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
+    let mut should_dial = true;
+    if let Ok(resp) = auto_dial_resp {
+        if let Some(data) = resp.data {
+            if data.contains("^SETAUTODIAL:0") || data.contains("^SETAUTODIAL: 0") {
+                warn!("Auto-dial is DISABLED in modem settings. Aborting dial phase.");
+                should_dial = false;
+            }
+        }
+    }
+
+    if should_dial {
+        // Use existing logic for CGACT and QNETDEVCTL
+        if let Err(e) = perform_dial(config, at_client).await {
+            warn!("Dial attempt failed: {}", e);
+        }
+    }
+    
+    // 3. 循环查询 IP，直到拿到有效 IP
+    wait_for_ip(at_client).await;
+
+    info!("=== Phase 3: Bind Data Channel ===");
+    // 1. 将 CID 1 的流量绑定到 NCM 网卡
+    let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
+    
+    // 2. 通知 OpenWrt 系统重启 eth2 的网络接口，触发 udhcpc
+    info!("Restarting OpenWrt network interface...");
+    match Command::new("ifup").arg("wan_modem").spawn() {
+        Ok(_) => info!("Data channel bounded. Network is UP!"),
+        Err(e) => error!("Failed to bring up wan_modem: {}", e),
+    }
+}
+
+async fn wait_for_cpin_ready(at_client: &ATClient) {
+    info!("Waiting for SIM card to be READY...");
+    loop {
+        if let Ok(resp) = at_client.send_command("AT+CPIN?".to_string()).await {
+            if let Some(data) = resp.data {
+                if data.contains("+CPIN: READY") || data.contains("+CPIN:READY") {
+                    info!("SIM Card is READY.");
+                    break;
+                }
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn wait_for_ip(at_client: &ATClient) {
+    info!("Waiting for valid IP address...");
+    loop {
+        if let Ok(has_ip) = check_ip_status(at_client).await {
+            if has_ip {
+                info!("IP successfully obtained.");
+                break;
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 async fn detect_modem_ifname(configured: &str) -> String {
