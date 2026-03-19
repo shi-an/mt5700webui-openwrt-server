@@ -306,6 +306,63 @@ impl NewSMSHandler {
     }
 }
 
+/// 处理 ^NDISSTAT URC，实时感知 NDIS 拨号连接状态变化
+/// 参考 MT5700M-CN AT命令手册 16.2 ^NDISSTAT
+/// 格式: ^NDISSTAT: [<cid>,]<stat>,[<err>],[<wx_state>],<PDP_type>
+/// stat: 0=断开, 1=已连接
+pub struct NdisStatHandler;
+
+#[async_trait]
+impl MessageHandler for NdisStatHandler {
+    fn can_handle(&self, line: &str) -> bool {
+        line.starts_with("^NDISSTAT:")
+    }
+    async fn handle(
+        &self,
+        line: &str,
+        _notifications: &NotificationManager,
+        _cmd_tx: &CommandSender,
+    ) -> Result<()> {
+        // ^NDISSTAT: 1,,,"IPV4"  or  ^NDISSTAT: 0,0,,"IPV4"
+        let data = line.trim_start_matches("^NDISSTAT:").trim();
+        let parts: Vec<&str> = data.splitn(4, ',').collect();
+
+        // stat 可能在第1位（无cid前缀）或第2位（有cid前缀），通过是否能parse为数字判断
+        let stat = parts.first().and_then(|s| s.trim().parse::<u8>().ok());
+        let pdp_type = parts.last().map(|s| s.trim().trim_matches('"')).unwrap_or("");
+
+        let (connected, stat_str) = match stat {
+            Some(1) => (true, "connected"),
+            Some(0) => (false, "disconnected"),
+            _ => {
+                warn!("^NDISSTAT: unrecognized format: {}", line);
+                return Ok(());
+            }
+        };
+
+        if connected {
+            info!("^NDISSTAT: NDIS connection established ({})", pdp_type);
+        } else {
+            let err_code = parts.get(1).map(|s| s.trim()).unwrap_or("0");
+            warn!("^NDISSTAT: NDIS connection lost (err={}, type={})", err_code, pdp_type);
+        }
+
+        // 广播给前端 WebSocket
+        if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+            let msg = serde_json::json!({
+                "type": "ndis_stat",
+                "data": {
+                    "connected": connected,
+                    "status": stat_str,
+                    "pdp_type": pdp_type,
+                }
+            }).to_string();
+            let _ = tx.send(msg);
+        }
+        Ok(())
+    }
+}
+
 pub struct PDCPDataHandler;
 #[async_trait]
 impl MessageHandler for PDCPDataHandler {

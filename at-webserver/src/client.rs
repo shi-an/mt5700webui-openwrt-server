@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::connection::{ATConnection, NetworkATConnection, SerialATConnection};
-use crate::handlers::{CallHandler, MemoryFullHandler, MessageHandler, NetworkSignalHandler, NewSMSHandler, PDCPDataHandler};
+use crate::handlers::{CallHandler, MemoryFullHandler, MessageHandler, NetworkSignalHandler, NewSMSHandler, NdisStatHandler, PDCPDataHandler};
 use crate::models::{ATResponse, CommandSender, ConnectionType};
 use crate::notifications::NotificationManager;
 use log::{error, info, warn, debug};
@@ -69,6 +69,7 @@ impl ATClientActor {
                 Box::new(CallHandler),
                 Box::new(MemoryFullHandler),
                 Box::new(NewSMSHandler::new(config.notification_config.sms_delete_after_forward)),
+                Box::new(NdisStatHandler),
                 Box::new(PDCPDataHandler),
                 Box::new(NetworkSignalHandler::new()),
             ];
@@ -85,6 +86,7 @@ impl ATClientActor {
             Box::new(CallHandler),
             Box::new(MemoryFullHandler),
             Box::new(NewSMSHandler::new(config.notification_config.sms_delete_after_forward)),
+            Box::new(NdisStatHandler),
             Box::new(PDCPDataHandler),
             Box::new(NetworkSignalHandler::new()),
         ];
