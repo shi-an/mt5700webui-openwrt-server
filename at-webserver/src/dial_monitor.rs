@@ -321,102 +321,113 @@ async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
     Ok(())
 }
 
+/// 四级灾难恢复入口（基于 MT5700M-CN AT命令手册）
+///
+/// L1: AT^HVSST=1,0/1   SIM 软拔插     → SIM 接触/识别异常
+/// L2: AT+CFUN=4/1      射频 offline   → 射频/NAS 层卡死
+/// L3: AT+CGATT=0/1     PS DETACH      → EPS Bearer 卡死（注网有但无IP）
+/// L4: AT+CFUN=1,1      模组复位       → 所有软恢复失败的最后手段
 async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
-    info!("=== Phase 1: Disaster Recovery (Soft SIM Plug/Unplug) ===");
+    // ── Level-1: SIM 软拔插 ──────────────────────────────────────────────────
+    info!("[L1] SIM soft replug (AT^HVSST=1,0 -> AT^HVSST=1,1)");
     let _ = at_client.send_command("AT^HVSST=1,0".to_string()).await;
     sleep(Duration::from_secs(3)).await;
     let _ = at_client.send_command("AT^HVSST=1,1".to_string()).await;
 
-    let is_cpin_ready = wait_for_cpin_ready(at_client).await;
-
-    if !is_cpin_ready {
-        warn!("SIM card failed to recover via AT^HVSST. Triggering Level-2 Recovery (Radio Toggle)...");
-        let _ = at_client.send_command("AT+CFUN=4".to_string()).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = at_client.send_command("AT+CFUN=1".to_string()).await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let final_check = wait_for_cpin_ready(at_client).await;
-        if !final_check {
-            error!("Level-2 Recovery failed. Modem requires a hard reboot.");
+    if wait_for_cpin_ready(at_client).await {
+        info!("[L1] SIM READY. Attempting dial...");
+        if try_dial_and_bind(config, at_client).await {
+            return;
+        }
+        // 拨号后超时无IP：判断是否 EPS Bearer 卡死，是则直接升 L3
+        if check_registration(at_client).await {
+            warn!("[L1] Registered but no IP (EPS Bearer stuck). Escalating to L3.");
+            if level3_ps_detach(config, at_client).await { return; }
+            level4_reset(at_client).await;
             return;
         }
     }
 
-    info!("=== Phase 2: Configuration & Activation (Dial) ===");
+    // ── Level-2: 射频 Offline/Online ─────────────────────────────────────────
+    // 手册：CFUN=0/1 间隔至少 1s；CFUN=4 = offline，CFUN=1 = online
+    warn!("[L2] Radio toggle (AT+CFUN=4 -> AT+CFUN=1)");
+    let _ = at_client.send_command("AT+CFUN=4".to_string()).await;
+    sleep(Duration::from_secs(3)).await;
+    let _ = at_client.send_command("AT+CFUN=1".to_string()).await;
+    sleep(Duration::from_secs(5)).await;
+
+    if wait_for_cpin_ready(at_client).await {
+        info!("[L2] SIM READY after radio toggle. Attempting dial...");
+        if try_dial_and_bind(config, at_client).await {
+            return;
+        }
+        if check_registration(at_client).await {
+            warn!("[L2] Registered but no IP after radio toggle. Escalating to L3.");
+            if level3_ps_detach(config, at_client).await { return; }
+        }
+    }
+
+    // ── Level-4: 模组复位 ─────────────────────────────────────────────────────
+    level4_reset(at_client).await;
+}
+
+/// Level-3: PS 域强制 DETACH/ATTACH
+/// 手册说明：去附着时所有激活的 PDP 上下文自动失效，清除 EPS Bearer Context
+async fn level3_ps_detach(config: &Config, at_client: &ATClient) -> bool {
+    warn!("[L3] PS DETACH/ATTACH (AT+CGATT=0 -> AT+CGATT=1)");
+    let _ = at_client.send_command("AT+CGATT=0".to_string()).await;
+    sleep(Duration::from_secs(5)).await;
+    let _ = at_client.send_command("AT+CGATT=1".to_string()).await;
+    sleep(Duration::from_secs(8)).await;
+    info!("[L3] Re-dialing after PS ATTACH...");
+    try_dial_and_bind(config, at_client).await
+}
+
+/// Level-4: 模组复位
+/// 手册：AT+CFUN=1,1 在 online 模式下触发复位；AT^RESET 作为备用
+async fn level4_reset(at_client: &ATClient) {
+    error!("[L4] Modem reset (AT+CFUN=1,1)");
+    let ok = at_client.send_command("AT+CFUN=1,1".to_string()).await
+        .map(|r| r.success).unwrap_or(false);
+    if !ok {
+        warn!("[L4] AT+CFUN=1,1 failed, fallback to AT^RESET");
+        let _ = at_client.send_command("AT^RESET".to_string()).await;
+    }
+    info!("[L4] Waiting 35s for modem reboot...");
+    sleep(Duration::from_secs(35)).await;
+}
+
+/// 执行拨号并绑定数据通道，返回 true 表示成功
+async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
     let auto_dial_resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
     let mut should_dial = true;
     if let Ok(resp) = auto_dial_resp {
         if let Some(data) = resp.data {
             if data.contains("^SETAUTODIAL:0") || data.contains("^SETAUTODIAL: 0") {
-                warn!("Auto-dial is DISABLED in modem settings. Aborting dial phase.");
+                warn!("[dial] Auto-dial disabled in modem. Skipping.");
                 should_dial = false;
             }
         }
     }
-
     if should_dial {
-        info!("Disconnecting NDIS binding before activation...");
         let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
         if let Err(e) = perform_dial(config, at_client).await {
-            warn!("Dial attempt failed: {}", e);
+            warn!("[dial] perform_dial failed: {}", e);
         }
     }
-
-    // 等待有效 IP，最多 120 秒
     if !wait_for_ip(at_client).await {
-        // Level-3：IP 等待超时，说明基带 EPS Bearer 卡死（注网成功但无数据承载）
-        // 执行强制 PS DETACH → ATTACH，清除所有 EPS Bearer Context
-        warn!("=== Level-3 Recovery: PS Domain DETACH/ATTACH (EPS Bearer stuck) ===");
-        info!("[Level-3] Checking registration status before DETACH...");
-        let cereg_ok = check_registration(at_client).await;
-        if cereg_ok {
-            warn!("[Level-3] Modem is registered but has no IP - EPS Bearer stuck confirmed.");
-        }
-        info!("[Level-3] Forcing PS DETACH...");
-        let _ = at_client.send_command("AT+CGATT=0".to_string()).await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        info!("[Level-3] Forcing PS ATTACH...");
-        let _ = at_client.send_command("AT+CGATT=1".to_string()).await;
-        tokio::time::sleep(Duration::from_secs(8)).await;
-
-        // 重新激活 PDP
-        if should_dial {
-            info!("[Level-3] Re-activating PDP after ATTACH...");
-            let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
-            let _ = perform_dial(config, at_client).await;
-        }
-
-        if !wait_for_ip(at_client).await {
-            // Level-4：彻底软重启模组
-            error!("=== Level-4 Recovery: Modem Soft Reset (AT^RESET) ===");
-            warn!("[Level-4] All recovery attempts failed. Issuing AT^RESET...");
-            let _ = at_client.send_command("AT^RESET".to_string()).await;
-            // 等待模组重启完成（约 30 秒）
-            info!("[Level-4] Waiting 30s for modem to reboot...");
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            // 重启后状态机回到 Disconnected，下一轮轮询会重新走完整拨号流程
-            return;
-        }
+        warn!("[dial] Timed out waiting for IP.");
+        return false;
     }
-
-    info!("=== Phase 3: Bind Data Channel ===");
+    info!("[dial] IP obtained. Binding NDIS channel...");
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
-    info!("Waiting for modem DHCP server to be ready...");
     sleep(Duration::from_secs(3)).await;
-
-    info!("Restarting physical link...");
-    let ifname = &config.advanced_network_config.ifname;
-    let actual_ifname = detect_modem_ifname(ifname).await;
-
-    match Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await {
-        Ok(_) => info!("Interface {} brought down", actual_ifname),
-        Err(e) => error!("Failed to down {}: {}", actual_ifname, e),
-    }
+    let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
+    let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await;
     sleep(Duration::from_secs(1)).await;
-    match Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await {
-        Ok(_) => info!("Data channel bound. Link restarted!"),
-        Err(e) => error!("Failed to up {}: {}", actual_ifname, e),
-    }
+    let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await;
+    info!("[dial] Interface {} restarted. Recovery complete.", actual_ifname);
+    true
 }
 
 /// 检查模组是否已注网（CS/PS 域）
