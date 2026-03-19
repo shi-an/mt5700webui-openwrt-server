@@ -61,8 +61,10 @@ pub struct NotificationConfig {
     pub notify_log_persist: bool,
     pub notify_sms: bool,
     pub notify_call: bool,
-    pub notify_memory_full: bool,
-    pub notify_signal: bool,
+    /// 短信存储使用率超过此百分比时通知（0=禁用，1-100=阈值）
+    pub notify_memory_full_threshold: u8,
+    /// 信号强度（RSRP dBm 绝对值）低于此值时通知（0=禁用）
+    pub notify_signal_threshold: i32,
     pub sms_delete_after_forward: bool,
 }
 
@@ -165,8 +167,8 @@ impl Default for Config {
                 notify_log_persist: false,
                 notify_sms: true,
                 notify_call: true,
-                notify_memory_full: true,
-                notify_signal: true,
+                notify_memory_full_threshold: 90,
+                notify_signal_threshold: 0,
                 sms_delete_after_forward: false,
             },
             websocket_config: WebSocketConfig {
@@ -368,8 +370,8 @@ impl Config {
 
         config.notification_config.notify_sms = get_bool("notify_sms", true);
         config.notification_config.notify_call = get_bool("notify_call", true);
-        config.notification_config.notify_memory_full = get_bool("notify_memory_full", true);
-        config.notification_config.notify_signal = get_bool("notify_signal", true);
+        config.notification_config.notify_memory_full_threshold = get_u8("notify_memory_full_threshold", 90);
+        config.notification_config.notify_signal_threshold = uci_data.get("notify_signal_threshold").and_then(|s| s.parse().ok()).unwrap_or(0);
         config.notification_config.sms_delete_after_forward = get_bool("sms_delete_after_forward", false);
 
         // WebSocket Config

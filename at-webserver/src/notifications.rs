@@ -427,8 +427,31 @@ impl NotificationManager {
         let should_notify = match notification_type {
             NotificationType::SMS => self.config.notify_sms,
             NotificationType::Call => self.config.notify_call,
-            NotificationType::MemoryFull => self.config.notify_memory_full,
-            NotificationType::Signal => self.config.notify_signal,
+            NotificationType::MemoryFull => self.config.notify_memory_full_threshold > 0,
+            NotificationType::Signal => {
+                // signal_threshold == 0 表示禁用信号通知
+                // signal_threshold > 0 表示 RSRP 低于 -threshold dBm 才通知
+                // 例如 threshold=100 表示 RSRP < -100 dBm 时通知
+                let threshold = self.config.notify_signal_threshold;
+                if threshold <= 0 {
+                    false
+                } else {
+                    // 从 content 中提取 RSRP 值判断是否超过阈值
+                    // content 格式包含 "RSRP: -95 dBm" 等字符串
+                    let rsrp = content
+                        .lines()
+                        .find(|l| l.contains("RSRP:"))
+                        .and_then(|l| {
+                            l.split_whitespace()
+                                .skip_while(|s| *s != "RSRP:")
+                                .nth(1)
+                                .and_then(|s| s.parse::<i32>().ok())
+                        });
+                    // RSRP 是负数，低于 -threshold 才通知
+                    // 例如 threshold=100：rsrp < -100 时通知
+                    rsrp.map(|r| r < -threshold).unwrap_or(true)
+                }
+            }
         };
 
         if should_notify {

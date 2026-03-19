@@ -180,16 +180,6 @@ return view.extend({
 
 		// --- 高级网络 ---
 		
-		o = s.taboption('network', form.ListValue, 'pdp_type', _('PDP 类型'), _('选择拨号协议类型'));
-		o.value('ipv4', 'IPv4 Only');
-		// o.value('ipv6', 'IPv6 Only');
-		o.value('ipv4v6', 'IPv4 + IPv6');
-		o.default = 'ipv4v6';
-		
-		o = s.taboption('network', form.Value, 'ifname', _('物理网卡接口'), _('模块拨号后生成的网卡名，默认 auto 自动探测（如 usb0, wwan0, eth2）'));
-		o.default = 'auto';
-		o.placeholder = 'auto';
-
 		o = s.taboption('network', form.DynamicList, 'dns_list', _('自定义 DNS'), _('留空则自动使用运营商下发的 DNS。填写后将强制使用此处指定的 DNS 服务器。'));
 		o.datatype = 'ipaddr';
 		o.optional = true;
@@ -344,16 +334,16 @@ return view.extend({
 		o = s.taboption('notify', form.Flag, 'notify_call', _('来电通知'), _('来电时发送通知'));
 		o.default = '1';
 
-		o = s.taboption('notify', form.Flag, 'notify_memory_full', _('存储满通知'), _('短信存储空间满时发送警告'));
-		o.default = '1';
+		o = s.taboption('notify', form.Value, 'notify_memory_full_threshold', _('存储满通知阈值'), _('短信存储使用率超过此值时发送警告（0=禁用，1-100 表示百分比，推荐 80）'));
+		o.datatype = 'range(0,100)';
 
 		// 新增：短信转发后是否删除原短信
 		o = s.taboption('notify', form.Flag, 'sms_delete_after_forward', _('第三方转发后删除短信'), _('启用后，只有当短信成功转发到第三方通道（如微信、钉钉等）后，才自动从 SIM 卡存储中删除该短信。WebSocket 实时推送不会触发删除。'));
 		o.default = '0';
 		o.depends('notify_sms', '1');
 
-		o = s.taboption('notify', form.Flag, 'notify_signal', _('信号变化通知'), _('网络信号强度变化或制式切换时发送通知'));
-		o.default = '0';
+		o = s.taboption('notify', form.Value, 'notify_signal_threshold', _('信号通知阈值'), _('RSRP 低于 -N dBm 时发送通知（0=禁用，推荐 100 表示低于 -100 dBm 时通知）'));
+		o.datatype = 'uinteger';
 
 		// ---------------------------------------------------------
 		// 第三方推送通道 (修复 Bug：将原 MultiValue 改为独立开关)
