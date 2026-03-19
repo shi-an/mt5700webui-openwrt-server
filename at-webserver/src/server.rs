@@ -272,6 +272,47 @@ async fn handle_client(
                              continue;
                          }
 
+                         // 【配置持久化】：前端发 SET_CONFIG:key=value 保存配置到 UCI
+                         // 例如：SET_CONFIG:sms_storage=ME
+                         // 后端写入 UCI 后返回结果，服务重启时自动读取
+                         if let Some(kv) = cmd_str.trim().strip_prefix("SET_CONFIG:") {
+                             if let Some((key, value)) = kv.split_once('=') {
+                                 let key = key.trim().to_string();
+                                 let value = value.trim().to_string();
+                                 // 白名单：只允许保存已知的配置 key，防止注入
+                                 let allowed_keys = [
+                                     "sms_storage",
+                                 ];
+                                 let success = if allowed_keys.contains(&key.as_str()) {
+                                     let uci_key = format!("at-webserver.config.{}={}", key, value);
+                                     let set_ok = std::process::Command::new("uci")
+                                         .args(&["set", &uci_key])
+                                         .status()
+                                         .map(|s| s.success())
+                                         .unwrap_or(false);
+                                     if set_ok {
+                                         std::process::Command::new("uci")
+                                             .args(&["commit", "at-webserver"])
+                                             .status()
+                                             .map(|s| s.success())
+                                             .unwrap_or(false)
+                                     } else {
+                                         false
+                                     }
+                                 } else {
+                                     warn!("SET_CONFIG: key '{}' not in allowlist, rejected", key);
+                                     false
+                                 };
+                                 let resp = WSResponse {
+                                     success,
+                                     data: if success { Some(format!("{}={} saved", key, value)) } else { None },
+                                     error: if success { None } else { Some(format!("Failed to save {}", key)) },
+                                 };
+                                 let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
+                             }
+                             continue;
+                         }
+
                          if cmd_str.starts_with("AT^SYSCFGEX") {
                              cmd_str = cmd_str.replace('\n', "").replace('\r', "").replace("OK", "");
                              if cmd_str.contains(",\"\",\"\"") {
