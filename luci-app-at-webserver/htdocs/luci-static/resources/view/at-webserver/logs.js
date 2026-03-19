@@ -7,48 +7,136 @@
 return view.extend({
 	load: function() {
 		return uci.load('at-webserver').then(function() {
-			// 智能判断：根据配置页面的“持久化”开关，自动决定去哪个路径读日志
-			var isPersist = uci.get('at-webserver', 'config', 'notify_log_persist') == '1';
-			var logPath = isPersist ? '/var/log/at-notifications.log' : '/tmp/at-notifications.log';
+			var notifyPersist = uci.get('at-webserver', 'config', 'notify_log_persist') == '1';
+			var syslogPersist = uci.get('at-webserver', 'config', 'sys_log_persist') == '1';
+			var notifyPath = notifyPersist ? '/var/log/at-notifications.log' : '/tmp/at-notifications.log';
+			var sysPath    = syslogPersist  ? '/var/log/at-webserver.log'    : '/tmp/at-webserver.log';
 
-			return fs.read_direct(logPath).then(function(res) {
-				return res.trim() ? res : _('------ 推送通知日志为空 ------');
-			}).catch(function(err) {
-				return _('------ 日志文件暂未生成 ------\n(当前监听路径: ' + logPath + ')');
-			}).then(function(logData) {
-				return { data: logData, path: logPath };
+			return Promise.all([
+				fs.read_direct(notifyPath).then(function(r) {
+					return r.trim() ? r : _('------ 推送通知日志为空 ------');
+				}).catch(function() {
+					return _('------ 日志文件暂未生成 ------\n(路径: ' + notifyPath + ')');
+				}),
+				fs.read_direct(sysPath).then(function(r) {
+					return r.trim() ? r : _('------ 系统运行日志为空 ------');
+				}).catch(function() {
+					return _('------ 日志文件暂未生成 ------\n(路径: ' + sysPath + ')');
+				})
+			]).then(function(results) {
+				return {
+					notifyData: results[0], notifyPath: notifyPath,
+					sysData:    results[1], sysPath:    sysPath
+				};
 			});
 		});
 	},
 
-	render: function(logInfo) {
-		return E('div', { class: 'cbi-map' }, [
-			E('h2', {}, _('推送通知日志')),
-			E('div', { class: 'cbi-map-descr' }, _('实时查看短信、来电及系统事件的推送记录。当前日志存储在：') + '<code>' + logInfo.path + '</code>'),
-			
-			E('div', { class: 'cbi-section' }, [
-				E('textarea', {
-					id: 'notify_log_content',
-					class: 'cbi-input-textarea',
-					style: 'width: 100%; height: 500px; font-family: monospace; resize: vertical; background: #f8f9fa;',
-					readonly: true,
-					wrap: 'off'
-				}, logInfo.data)
-			]),
+	render: function(info) {
+		var splitStyle = 'display:flex; flex-direction:column; gap:0; height:calc(100vh - 120px); min-height:500px;';
+		var paneStyle  = 'flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;';
+		var dividerStyle = 'height:6px; background:linear-gradient(90deg,#0099CC,#00c8ff,#0099CC); cursor:ns-resize; flex-shrink:0; border-radius:3px; margin:2px 0;';
+		var headerStyle = 'display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:#1e1e2e; color:#cdd6f4; font-family:monospace; font-size:13px; flex-shrink:0; border-radius:4px 4px 0 0;';
+		var taNotify = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#f8f9fa; color:#333; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
+		var taSys    = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#1e1e2e; color:#a6e3a1; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
 
-			E('div', { class: 'right' }, [
-				E('button', {
-					class: 'btn cbi-button cbi-button-negative',
-					click: function() {
-						fs.write(logInfo.path, '').then(function() {
-							document.getElementById('notify_log_content').value = _('------ 推送通知日志已清空 ------');
-							ui.addNotification(null, E('p', _('日志清空成功！')), 'info');
-						}).catch(function(e) {
-							ui.addNotification(null, E('p', _('清空失败: ') + e.message), 'error');
-						});
-					}
-				}, _('清空日志'))
-			])
+		function makeBtn(label, cls, fn) {
+			return E('button', { class: 'btn cbi-button ' + cls, style: 'margin-left:8px; padding:2px 10px; font-size:12px;', click: fn }, label);
+		}
+
+		var notifyTA = E('textarea', {
+			id: 'notify_log_content',
+			style: taNotify,
+			readonly: true,
+			wrap: 'off'
+		}, info.notifyData);
+
+		var sysTA = E('textarea', {
+			id: 'sys_log_content',
+			style: taSys,
+			readonly: true,
+			wrap: 'off'
+		}, info.sysData);
+
+		// 滚动到底部
+		setTimeout(function() {
+			notifyTA.scrollTop = notifyTA.scrollHeight;
+			sysTA.scrollTop    = sysTA.scrollHeight;
+		}, 50);
+
+		// 拖拽分隔条调整上下比例
+		var divider = E('div', { style: dividerStyle, title: _('拖拽调整上下比例') });
+		var container;
+		divider.addEventListener('mousedown', function(e) {
+			e.preventDefault();
+			var startY = e.clientY;
+			var panes  = container.querySelectorAll('.log-pane');
+			var topH   = panes[0].getBoundingClientRect().height;
+			var botH   = panes[1].getBoundingClientRect().height;
+			function onMove(e) {
+				var dy = e.clientY - startY;
+				var newTop = Math.max(80, topH + dy);
+				var newBot = Math.max(80, botH - dy);
+				panes[0].style.flex = 'none';
+				panes[0].style.height = newTop + 'px';
+				panes[1].style.flex = 'none';
+				panes[1].style.height = newBot + 'px';
+			}
+			function onUp() {
+				document.removeEventListener('mousemove', onMove);
+				document.removeEventListener('mouseup', onUp);
+			}
+			document.addEventListener('mousemove', onMove);
+			document.addEventListener('mouseup', onUp);
+		});
+
+		var notifyPane = E('div', { class: 'log-pane', style: paneStyle }, [
+			E('div', { style: headerStyle }, [
+				E('span', {}, '📨 ' + _('推送通知日志') + '  ​' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.notifyPath).outerHTML),
+				E('span', {}, [
+					makeBtn(_('刷新'), 'cbi-button-action', function() {
+						fs.read_direct(info.notifyPath).then(function(r) {
+							notifyTA.value = r.trim() ? r : _('------ 推送通知日志为空 ------');
+							notifyTA.scrollTop = notifyTA.scrollHeight;
+						}).catch(function() { notifyTA.value = _('读取失败'); });
+					}),
+					makeBtn(_('清空'), 'cbi-button-negative', function() {
+						fs.write(info.notifyPath, '').then(function() {
+							notifyTA.value = _('------ 推送通知日志已清空 ------');
+							ui.addNotification(null, E('p', _('推送日志已清空')), 'info');
+						}).catch(function(e) { ui.addNotification(null, E('p', '清空失败: ' + e.message), 'error'); });
+					})
+				])
+			]),
+			notifyTA
+		]);
+
+		var sysPane = E('div', { class: 'log-pane', style: paneStyle }, [
+			E('div', { style: headerStyle }, [
+				E('span', {}, '🖥 ' + _('系统运行日志') + '  ​' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.sysPath).outerHTML),
+				E('span', {}, [
+					makeBtn(_('刷新'), 'cbi-button-action', function() {
+						fs.read_direct(info.sysPath).then(function(r) {
+							sysTA.value = r.trim() ? r : _('------ 系统运行日志为空 ------');
+							sysTA.scrollTop = sysTA.scrollHeight;
+						}).catch(function() { sysTA.value = _('读取失败'); });
+					}),
+					makeBtn(_('清空'), 'cbi-button-negative', function() {
+						fs.write(info.sysPath, '').then(function() {
+							sysTA.value = _('------ 系统运行日志已清空 ------');
+							ui.addNotification(null, E('p', _('系统日志已清空')), 'info');
+						}).catch(function(e) { ui.addNotification(null, E('p', '清空失败: ' + e.message), 'error'); });
+					})
+				])
+			]),
+			sysTA
+		]);
+
+		container = E('div', { style: splitStyle }, [ notifyPane, divider, sysPane ]);
+
+		return E('div', { class: 'cbi-map' }, [
+			E('h2', {}, _('日志')),
+			container
 		]);
 	},
 
