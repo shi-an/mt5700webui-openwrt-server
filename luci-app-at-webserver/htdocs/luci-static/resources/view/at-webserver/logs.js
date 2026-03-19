@@ -33,15 +33,24 @@ return view.extend({
 	},
 
 	render: function(info) {
-		var splitStyle = 'display:flex; flex-direction:column; gap:0; height:calc(100vh - 120px); min-height:500px;';
-		var paneStyle  = 'flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;';
+		var splitStyle   = 'display:flex; flex-direction:column; gap:0; height:calc(100vh - 120px); min-height:500px;';
+		var paneStyle    = 'flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden;';
 		var dividerStyle = 'height:6px; background:linear-gradient(90deg,#0099CC,#00c8ff,#0099CC); cursor:ns-resize; flex-shrink:0; border-radius:3px; margin:2px 0;';
-		var headerStyle = 'display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:#1e1e2e; color:#cdd6f4; font-family:monospace; font-size:13px; flex-shrink:0; border-radius:4px 4px 0 0;';
-		var taNotify = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#f8f9fa; color:#333; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
-		var taSys    = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#1e1e2e; color:#a6e3a1; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
+		var headerStyle  = 'display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:#1e1e2e; color:#cdd6f4; font-family:monospace; font-size:13px; flex-shrink:0; border-radius:4px 4px 0 0;';
+		var taNotify     = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#f8f9fa; color:#333; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
+		var taSys        = 'width:100%; flex:1; font-family:monospace; font-size:12px; resize:none; background:#1e1e2e; color:#a6e3a1; border:none; padding:8px; box-sizing:border-box; overflow:auto;';
+
+		// 判断 textarea 是否滚动到底部（误差 4px）
+		function isAtBottom(ta) {
+			return ta.scrollHeight - ta.scrollTop - ta.clientHeight < 4;
+		}
 
 		function makeBtn(label, cls, fn) {
-			return E('button', { class: 'btn cbi-button ' + cls, style: 'margin-left:8px; padding:2px 10px; font-size:12px;', click: fn }, label);
+			return E('button', {
+				class: 'btn cbi-button ' + cls,
+				style: 'margin-left:8px; padding:2px 10px; font-size:12px;',
+				click: fn
+			}, label);
 		}
 
 		var notifyTA = E('textarea', {
@@ -58,13 +67,29 @@ return view.extend({
 			wrap: 'off'
 		}, info.sysData);
 
-		// 滚动到底部
+		// 自动刷新：每 3 秒轮询一次，若已在底部则自动滚底，否则保持当前位置
+		function startAutoRefresh(ta, path, emptyMsg) {
+			return setInterval(function() {
+				var atBottom = isAtBottom(ta);
+				fs.read_direct(path).then(function(r) {
+					var newVal = r.trim() ? r : emptyMsg;
+					if (ta.value !== newVal) {
+						ta.value = newVal;
+						if (atBottom) ta.scrollTop = ta.scrollHeight;
+					}
+				}).catch(function() {});
+			}, 3000);
+		}
+
+		// 页面加载后滚到底部，并启动自动刷新
 		setTimeout(function() {
 			notifyTA.scrollTop = notifyTA.scrollHeight;
 			sysTA.scrollTop    = sysTA.scrollHeight;
+			startAutoRefresh(notifyTA, info.notifyPath, _('------ 推送通知日志为空 ------'));
+			startAutoRefresh(sysTA,    info.sysPath,    _('------ 系统运行日志为空 ------'));
 		}, 50);
 
-		// 拖拽分隔条调整上下比例
+		// 拖拽分隔条
 		var divider = E('div', { style: dividerStyle, title: _('拖拽调整上下比例') });
 		var container;
 		divider.addEventListener('mousedown', function(e) {
@@ -75,12 +100,10 @@ return view.extend({
 			var botH   = panes[1].getBoundingClientRect().height;
 			function onMove(e) {
 				var dy = e.clientY - startY;
-				var newTop = Math.max(80, topH + dy);
-				var newBot = Math.max(80, botH - dy);
 				panes[0].style.flex = 'none';
-				panes[0].style.height = newTop + 'px';
+				panes[0].style.height = Math.max(80, topH + dy) + 'px';
 				panes[1].style.flex = 'none';
-				panes[1].style.height = newBot + 'px';
+				panes[1].style.height = Math.max(80, botH - dy) + 'px';
 			}
 			function onUp() {
 				document.removeEventListener('mousemove', onMove);
@@ -92,13 +115,10 @@ return view.extend({
 
 		var notifyPane = E('div', { class: 'log-pane', style: paneStyle }, [
 			E('div', { style: headerStyle }, [
-				E('span', {}, '📨 ' + _('推送通知日志') + '  ​' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.notifyPath).outerHTML),
+				E('span', {}, '\u{1F4E8} ' + _('推送通知日志') + '  \u200B' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.notifyPath).outerHTML),
 				E('span', {}, [
-					makeBtn(_('刷新'), 'cbi-button-action', function() {
-						fs.read_direct(info.notifyPath).then(function(r) {
-							notifyTA.value = r.trim() ? r : _('------ 推送通知日志为空 ------');
-							notifyTA.scrollTop = notifyTA.scrollHeight;
-						}).catch(function() { notifyTA.value = _('读取失败'); });
+					makeBtn(_('滚到底部'), 'cbi-button-action', function() {
+						notifyTA.scrollTop = notifyTA.scrollHeight;
 					}),
 					makeBtn(_('清空'), 'cbi-button-negative', function() {
 						fs.write(info.notifyPath, '').then(function() {
@@ -113,13 +133,10 @@ return view.extend({
 
 		var sysPane = E('div', { class: 'log-pane', style: paneStyle }, [
 			E('div', { style: headerStyle }, [
-				E('span', {}, '🖥 ' + _('系统运行日志') + '  ​' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.sysPath).outerHTML),
+				E('span', {}, '\u{1F5A5} ' + _('系统运行日志') + '  \u200B' + E('code', { style: 'font-size:11px; color:#89b4fa;' }, info.sysPath).outerHTML),
 				E('span', {}, [
-					makeBtn(_('刷新'), 'cbi-button-action', function() {
-						fs.read_direct(info.sysPath).then(function(r) {
-							sysTA.value = r.trim() ? r : _('------ 系统运行日志为空 ------');
-							sysTA.scrollTop = sysTA.scrollHeight;
-						}).catch(function() { sysTA.value = _('读取失败'); });
+					makeBtn(_('滚到底部'), 'cbi-button-action', function() {
+						sysTA.scrollTop = sysTA.scrollHeight;
 					}),
 					makeBtn(_('清空'), 'cbi-button-negative', function() {
 						fs.write(info.sysPath, '').then(function() {
