@@ -364,8 +364,39 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
 
     // 等待有效 IP，最多 120 秒
     if !wait_for_ip(at_client).await {
-        error!("Timed out waiting for IP after dial. Aborting recovery.");
-        return;
+        // Level-3：IP 等待超时，说明基带 EPS Bearer 卡死（注网成功但无数据承载）
+        // 执行强制 PS DETACH → ATTACH，清除所有 EPS Bearer Context
+        warn!("=== Level-3 Recovery: PS Domain DETACH/ATTACH (EPS Bearer stuck) ===");
+        info!("[Level-3] Checking registration status before DETACH...");
+        let cereg_ok = check_registration(at_client).await;
+        if cereg_ok {
+            warn!("[Level-3] Modem is registered but has no IP - EPS Bearer stuck confirmed.");
+        }
+        info!("[Level-3] Forcing PS DETACH...");
+        let _ = at_client.send_command("AT+CGATT=0".to_string()).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        info!("[Level-3] Forcing PS ATTACH...");
+        let _ = at_client.send_command("AT+CGATT=1".to_string()).await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        // 重新激活 PDP
+        if should_dial {
+            info!("[Level-3] Re-activating PDP after ATTACH...");
+            let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
+            let _ = perform_dial(config, at_client).await;
+        }
+
+        if !wait_for_ip(at_client).await {
+            // Level-4：彻底软重启模组
+            error!("=== Level-4 Recovery: Modem Soft Reset (AT^RESET) ===");
+            warn!("[Level-4] All recovery attempts failed. Issuing AT^RESET...");
+            let _ = at_client.send_command("AT^RESET".to_string()).await;
+            // 等待模组重启完成（约 30 秒）
+            info!("[Level-4] Waiting 30s for modem to reboot...");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            // 重启后状态机回到 Disconnected，下一轮轮询会重新走完整拨号流程
+            return;
+        }
     }
 
     info!("=== Phase 3: Bind Data Channel ===");
@@ -386,6 +417,32 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
         Ok(_) => info!("Data channel bound. Link restarted!"),
         Err(e) => error!("Failed to up {}: {}", actual_ifname, e),
     }
+}
+
+/// 检查模组是否已注网（CS/PS 域）
+/// 返回 true 表示已注网但可能无数据承载（EPS Bearer 卡死场景）
+async fn check_registration(at_client: &ATClient) -> bool {
+    // 检查 LTE/5G PS 域注网状态
+    if let Ok(resp) = at_client.send_command("AT+CEREG?".to_string()).await {
+        if let Some(data) = resp.data {
+            // +CEREG: 0,1 或 +CEREG: 0,5 表示已注网
+            if data.contains(",1") || data.contains(",5") {
+                info!("[check_registration] CEREG: registered.");
+                return true;
+            }
+        }
+    }
+    // 回退检查 CREG
+    if let Ok(resp) = at_client.send_command("AT+CREG?".to_string()).await {
+        if let Some(data) = resp.data {
+            if data.contains(",1") || data.contains(",5") {
+                info!("[check_registration] CREG: registered.");
+                return true;
+            }
+        }
+    }
+    warn!("[check_registration] Not registered.");
+    false
 }
 
 async fn wait_for_cpin_ready(at_client: &ATClient) -> bool {
