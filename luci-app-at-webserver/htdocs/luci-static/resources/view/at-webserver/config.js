@@ -92,12 +92,6 @@ return view.extend({
 		o.default = '20249';
 		o.depends('connection_type', 'NETWORK');
 
-		o = s.taboption('general', form.Value, 'network_timeout', _('网络超时'),
-			_('网络连接超时时间（秒）'));
-		o.datatype = 'uinteger';
-		o.default = '10';
-		o.depends('connection_type', 'NETWORK');
-
 		// 模块访问安全配置
 		o = s.taboption('general', form.DummyValue, '_module_security_title', _('模块访问安全'));
 		o.rawhtml = true;
@@ -183,11 +177,6 @@ return view.extend({
 		o.default = '115200';
 		o.depends('connection_type', 'SERIAL');
 
-		o = s.taboption('general', form.Value, 'serial_timeout', _('串口超时'),
-			_('串口通信超时时间（秒）'));
-		o.datatype = 'uinteger';
-		o.default = '10';
-		o.depends('connection_type', 'SERIAL');
 
 		// --- 高级网络 ---
 		
@@ -201,16 +190,6 @@ return view.extend({
 		o.default = 'auto';
 		o.placeholder = 'auto';
 
-		o = s.taboption('network', form.Flag, 'ra_master', _('IPv6 RA Master'), _('启用后作为 IPv6 RA 主设备（分配 IPv6 地址）'));
-		o.default = '1';
-		o.depends('pdp_type', 'ipv6');
-		o.depends('pdp_type', 'ipv4v6');
-		
-		o = s.taboption('network', form.Flag, 'extend_prefix', _('IPv6 扩展前缀'), _('启用 IPv6 扩展前缀功能'));
-		o.default = '1';
-		o.depends('pdp_type', 'ipv6');
-		o.depends('pdp_type', 'ipv4v6');
-		
 		o = s.taboption('network', form.DynamicList, 'dns_list', _('自定义 DNS'), _('留空则自动使用运营商下发的 DNS。填写后将强制使用此处指定的 DNS 服务器。'));
 		o.datatype = 'ipaddr';
 		o.optional = true;

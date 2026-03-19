@@ -33,11 +33,19 @@
 		}
 	},
 	"admin/modem/atwebserver/logs": {
-		"title": "日志查看",
+		"title": "推送日志",
 		"order": 20,
 		"action": {
 			"type": "view",
 			"path": "at-webserver/logs"
+		}
+	},
+	"admin/modem/atwebserver/syslog": {
+		"title": "系统日志",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "at-webserver/syslog"
 		}
 	},
 	"admin/modem/atwebserver/debug": {
