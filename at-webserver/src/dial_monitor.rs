@@ -403,14 +403,23 @@ async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
     let mut should_dial = true;
     if let Ok(resp) = auto_dial_resp {
         if let Some(data) = resp.data {
-            if data.contains("^SETAUTODIAL:0") || data.contains("^SETAUTODIAL: 0") {
+            // 手册注意：响应前缀可能是 ^SETAUTODAIL（手册原文拼写）或 ^SETAUTODIAL
+            // 格式：^SETAUTODAIL:<enable>,<dial_mode>,...  或  ^SETAUTODIAL:<enable>
+            let disabled = data.lines().any(|line| {
+                let l = line.trim();
+                (l.starts_with("^SETAUTODIAL:") || l.starts_with("^SETAUTODAIL:"))
+                    && l.split(':').nth(1).map(|v| v.split(',').next().map(|e| e.trim() == "0").unwrap_or(false)).unwrap_or(false)
+            });
+            if disabled {
                 warn!("[dial] Auto-dial disabled in modem. Skipping.");
                 should_dial = false;
             }
         }
     }
     if should_dial {
+        // 手册：NDISDUP 是异步AT，断开后需等待 ^NDISSTAT: 0 确认，此处用 sleep 兜底
         let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
+        sleep(Duration::from_secs(2)).await;
         if let Err(e) = perform_dial(config, at_client).await {
             warn!("[dial] perform_dial failed: {}", e);
         }
@@ -420,8 +429,10 @@ async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
         return false;
     }
     info!("[dial] IP obtained. Binding NDIS channel...");
+    // 手册：NDISDUP 是异步AT，OK 只代表发送成功，实际连接由 ^NDISSTAT: 1 确认
+    // 此处 sleep 5s 等待 ^NDISSTAT 上报及 DHCP 就绪
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
-    sleep(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(5)).await;
     let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
     let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await;
     sleep(Duration::from_secs(1)).await;
