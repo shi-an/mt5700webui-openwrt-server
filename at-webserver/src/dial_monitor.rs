@@ -263,12 +263,31 @@ async fn check_ip_status(at_client: &ATClient) -> Result<IpStatus> {
                 continue;
             }
 
-            if clean_ip.contains('.') && clean_ip.len() <= 15 {
+            // MT5700M-CN 的 IPv6 地址以点分十进制格式返回（16个字节，共15个点）
+            // 例如: "32.8.0.2.0.2.0.1.255.255.255.255.255.255.255.255"
+            // 标准冒号格式: "2001:db8::1" 也兼容处理
+            let dot_count = clean_ip.chars().filter(|&c| c == '.').count();
+            let colon_count = clean_ip.chars().filter(|&c| c == ':').count();
+
+            if colon_count >= 2 {
+                // 标准 IPv6 冒号格式
+                debug!("Detected IPv6 (colon fmt): {}", clean_ip);
+                found_v6 = Some(clean_ip.to_string());
+            } else if dot_count == 15 {
+                // MT5700M-CN 点分十进制 IPv6 格式（16字节，15个点）
+                // 验证所有段都是 0-255 的数字
+                let all_valid = clean_ip.split('.').all(|s| s.parse::<u8>().is_ok());
+                if all_valid {
+                    debug!("Detected IPv6 (dotted-decimal fmt): {}", clean_ip);
+                    found_v6 = Some(clean_ip.to_string());
+                } else {
+                    debug!("Detected IPv4: {}", clean_ip);
+                    found_v4 = Some(clean_ip.to_string());
+                }
+            } else if clean_ip.contains('.') && dot_count == 3 {
+                // 标准 IPv4 格式（x.x.x.x）
                 debug!("Detected IPv4: {}", clean_ip);
                 found_v4 = Some(clean_ip.to_string());
-            } else if clean_ip.contains(':') && clean_ip.len() <= 39 {
-                debug!("Detected IPv6: {}", clean_ip);
-                found_v6 = Some(clean_ip.to_string());
             }
         }
     }
