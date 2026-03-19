@@ -135,18 +135,18 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 }
 
                                 let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
+                                // ipv6_needed：配置了 v6 协议类型（ipv4v6 / ipv6）
+                                // 注意：不依赖 ipv6_present（AT+CGPADDR 可能只返回数据 PDP 的 IPv4，
+                                // IMS/IPv6 地址不一定出现在响应中），只要配置了就尝试注入
                                 let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
-                                let ipv6_present = matches!(status, IpStatus::Ipv6Only(_) | IpStatus::DualStack(_, _));
 
-                                if ipv6_needed && ipv6_present {
-                                    info!("IPv6 is enabled and detected. Injecting IPv6 interface...");
+                                if ipv6_needed {
+                                    info!("IPv6 configured (pdp_type={}). Injecting IPv6 interface...", pdp_type);
                                     if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
                                         error!("Failed to inject IPv6 interface: {}", e);
                                     } else {
                                         info!("IPv6 Injection Completed.");
                                     }
-                                } else if ipv6_needed && !ipv6_present {
-                                    warn!("IPv6 configured but modem only has IPv4. Skipping IPv6 injection.");
                                 }
 
                                 state = ConnectionState::FullStackConfigured;
