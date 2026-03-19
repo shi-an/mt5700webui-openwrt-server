@@ -1,9 +1,10 @@
 use crate::client::ATClient;
 use crate::config::Config;
+use crate::models::get_ndis_disconnect_tx;
 use crate::network;
 use log::{info, warn, error, debug};
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, interval};
 use tokio::process::Command;
 use anyhow::Result;
 
@@ -40,10 +41,49 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
     
     let mut state = ConnectionState::Disconnected;
     let mut ping_fail_count = 0u32;
-    // 参考 QModem at_dial_monitor：连续 AT 异常响应超过阈值才触发重拨
     let mut unexpected_response_count = 0u32;
 
+    // 订阅 ^NDISSTAT 断开事件，断线时无需等待轮询立即响应
+    let ndis_tx = get_ndis_disconnect_tx();
+    let mut ndis_rx = ndis_tx.subscribe();
+
+    // 10 秒轮询定时器
+    let mut poll_timer = interval(Duration::from_secs(10));
+    poll_timer.tick().await; // 消耗第一个立即触发的 tick
+
     loop {
+        // 同时等待：轮询定时器 或 NDIS 断开事件（哪个先到处理哪个）
+        let ndis_disconnected = tokio::select! {
+            _ = poll_timer.tick() => {
+                false // 正常轮询
+            }
+            result = ndis_rx.recv() => {
+                match result {
+                    Ok(()) => {
+                        warn!("[NDISSTAT] Disconnect event received! Triggering immediate recovery.");
+                        true
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[NDISSTAT] Missed {} disconnect events, treating as disconnected.", n);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        };
+
+        // NDIS 断开事件直接触发恢复，跳过 IP 检查
+        if ndis_disconnected {
+            if !matches!(state, ConnectionState::Disconnected) {
+                state = ConnectionState::Disconnected;
+            }
+            trigger_disaster_recovery(&config, &at_client).await;
+            ping_fail_count = 0;
+            unexpected_response_count = 0;
+            continue;
+        }
+
+        // 常规轮询：检查 IP 状态
         match check_ip_status(&at_client).await {
             Ok(ip_status) => {
                 match ip_status {
@@ -142,8 +182,6 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 warn!("Failed to check IP status: {}. Retrying later.", e);
             }
         }
-
-        sleep(Duration::from_secs(10)).await;
     }
 }
 

@@ -345,6 +345,9 @@ impl MessageHandler for NdisStatHandler {
         } else {
             let err_code = parts.get(1).map(|s| s.trim()).unwrap_or("0");
             warn!("^NDISSTAT: NDIS connection lost (err={}, type={})", err_code, pdp_type);
+            // 立即通知 dial_monitor 触发恢复，无需等待下一次轮询
+            let tx = crate::models::get_ndis_disconnect_tx();
+            let _ = tx.send(());
         }
 
         // 广播给前端 WebSocket
