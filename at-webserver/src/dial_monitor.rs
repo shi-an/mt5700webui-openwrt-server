@@ -74,6 +74,14 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
 
         // NDIS 断开事件直接触发恢复，跳过 IP 检查
         if ndis_disconnected {
+            // 检查用户是否手动关闭了自动拨号，若关闭则不进行灾难恢复
+            if is_auto_dial_disabled(&at_client).await {
+                info!("[monitor] NDIS disconnected but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
+                state = ConnectionState::Disconnected;
+                ping_fail_count = 0;
+                unexpected_response_count = 0;
+                continue;
+            }
             if !matches!(state, ConnectionState::Disconnected) {
                 state = ConnectionState::Disconnected;
             }
@@ -101,6 +109,12 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
 
                     IpStatus::NoIp => {
                         unexpected_response_count = 0;
+                        // 检查用户是否手动关闭了自动拨号，若关闭则不触发灾难恢复
+                        if is_auto_dial_disabled(&at_client).await {
+                            info!("[monitor] No IP but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
+                            state = ConnectionState::Disconnected;
+                            continue;
+                        }
                         if !matches!(state, ConnectionState::Disconnected) {
                             warn!("Lost IP address. Resetting state and triggering disaster recovery.");
                             state = ConnectionState::Disconnected;
@@ -307,37 +321,37 @@ async fn check_ip_status(at_client: &ATClient) -> Result<IpStatus> {
 }
 
 /// MT5700M-CN 专用拨号函数。
-/// 
-/// 鼎桥 MT5700M-CN PDP 配置固定：
-///   CID 1 = 上网业务（CMNET/运营商数据）
-///   CID 2 = IMS 业务（VoLTE/短信）
-/// 无需动态扫描，直接硬编码激活。
+///
+/// 设计原则：后端不主动修改或激活 PDP 上下文。
+/// PDP 配置（AT+CGDCONT）和激活（AT+CGACT）由用户在前端完成，
+/// 模组内部已保存的 PDP 数据会在 NDISDUP 时自动使用。
+/// 后端只负责建立 NDIS 数据通道（AT^NDISDUP=1,1）。
 async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
-    // 检查自动拨号开关，尊重用户在模组上的配置
-    let resp_dial = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
-    if let Ok(response) = resp_dial {
-        if let Some(content) = response.data {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with("^SETAUTODIAL:") {
-                    let parts: Vec<&str> = line.trim_start_matches("^SETAUTODIAL:").split(',').collect();
-                    if parts.len() >= 1 && parts[0].trim() == "0" {
-                        info!("Auto-dial is disabled in hardware. Aborting perform_dial.");
-                        return Ok(());
-                    }
-                }
-            }
+    // 手册：NDISDUP 是异步AT，OK 只代表发送成功
+    // 实际连接建立由 ^NDISSTAT: 1 URC 确认
+    info!("[dial] Establishing NDIS data channel (AT^NDISDUP=1,1)...");
+    let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
+    Ok(())
+}
+
+/// 检查模组是否已被用户手动关闭自动拨号（AT^SETAUTODIAL=0）
+/// 返回 true 表示已关闭，后端不应触发灾难恢复
+async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
+    let resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
+    if let Ok(r) = resp {
+        if let Some(data) = r.data {
+            // 手册响应格式：^SETAUTODAIL:<enable> 或 ^SETAUTODIAL:<enable>,...
+            return data.lines().any(|line| {
+                let l = line.trim();
+                (l.starts_with("^SETAUTODIAL:") || l.starts_with("^SETAUTODAIL:"))
+                    && l.split(':').nth(1)
+                        .and_then(|v| v.split(',').next())
+                        .map(|e| e.trim() == "0")
+                        .unwrap_or(false)
+            });
         }
     }
-
-    // MT5700M-CN 固定 CID：1=数据, 2=IMS
-    info!("[MT5700M-CN] Activating Data PDP (CID=1)...");
-    let _ = at_client.send_command("AT+CGACT=1,1".to_string()).await;
-
-    info!("[MT5700M-CN] Activating IMS PDP (CID=2)...");
-    let _ = at_client.send_command("AT+CGACT=2,1".to_string()).await;
-
-    Ok(())
+    false // 查询失败时保守处理，不阻止恢复
 }
 
 /// 四级灾难恢复入口（基于 MT5700M-CN AT命令手册）
@@ -417,39 +431,24 @@ async fn level4_reset(at_client: &ATClient) {
 }
 
 /// 执行拨号并绑定数据通道，返回 true 表示成功
+/// 注意：调用此函数前已确认 SETAUTODIAL != 0
 async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
-    let auto_dial_resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
-    let mut should_dial = true;
-    if let Ok(resp) = auto_dial_resp {
-        if let Some(data) = resp.data {
-            // 手册注意：响应前缀可能是 ^SETAUTODAIL（手册原文拼写）或 ^SETAUTODIAL
-            // 格式：^SETAUTODAIL:<enable>,<dial_mode>,...  或  ^SETAUTODIAL:<enable>
-            let disabled = data.lines().any(|line| {
-                let l = line.trim();
-                (l.starts_with("^SETAUTODIAL:") || l.starts_with("^SETAUTODAIL:"))
-                    && l.split(':').nth(1).map(|v| v.split(',').next().map(|e| e.trim() == "0").unwrap_or(false)).unwrap_or(false)
-            });
-            if disabled {
-                warn!("[dial] Auto-dial disabled in modem. Skipping.");
-                should_dial = false;
-            }
-        }
+    // 断开旧 NDIS 连接
+    // 手册：NDISDUP 是异步AT，断开后需等待 ^NDISSTAT: 0，此处用 sleep 兜底
+    let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
+    sleep(Duration::from_secs(2)).await;
+
+    // perform_dial 只建立 NDIS 通道，PDP 由模组内部数据驱动
+    if let Err(e) = perform_dial(config, at_client).await {
+        warn!("[dial] perform_dial failed: {}", e);
     }
-    if should_dial {
-        // 手册：NDISDUP 是异步AT，断开后需等待 ^NDISSTAT: 0 确认，此处用 sleep 兜底
-        let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
-        sleep(Duration::from_secs(2)).await;
-        if let Err(e) = perform_dial(config, at_client).await {
-            warn!("[dial] perform_dial failed: {}", e);
-        }
-    }
+
     if !wait_for_ip(at_client).await {
         warn!("[dial] Timed out waiting for IP.");
         return false;
     }
     info!("[dial] IP obtained. Binding NDIS channel...");
-    // 手册：NDISDUP 是异步AT，OK 只代表发送成功，实际连接由 ^NDISSTAT: 1 确认
-    // 此处 sleep 5s 等待 ^NDISSTAT 上报及 DHCP 就绪
+    // 手册：NDISDUP 是异步AT，sleep 5s 等待 ^NDISSTAT: 1 及 DHCP 就绪
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
     sleep(Duration::from_secs(5)).await;
     let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
