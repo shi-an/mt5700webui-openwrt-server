@@ -1,0 +1,15 @@
+# QModem reference project (local only, not part of this repo)
+QModem/
+
+# Rust build artifacts
+target/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

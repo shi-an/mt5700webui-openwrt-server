@@ -102,38 +102,61 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn inject_ipv6_interface(config: &Config, ifname: &str) -> Result<()> {
-    info!("Injecting IPv6 interface for: {}", ifname);
-    
-    // 1. 配置 wan_modem6 (IPv6)
-    let mut uci_batch = String::new();
-    
-    uci_batch.push_str("delete network.wan_modem6\n");
-    
-    uci_batch.push_str("set network.wan_modem6=interface\n");
-    uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
-    uci_batch.push_str(&format!("set network.wan_modem6.device='{}'\n", ifname));
-    uci_batch.push_str(&format!("set network.wan_modem6.ifname='{}'\n", ifname));
-    uci_batch.push_str("set network.wan_modem6.metric='10'\n");
-    
-    uci_batch.push_str("set network.wan_modem6.reqaddress='try'\n");
-    uci_batch.push_str("set network.wan_modem6.reqprefix='auto'\n");
-    uci_batch.push_str("set network.wan_modem6.norelease='1'\n");
-    uci_batch.push_str("set network.wan_modem6.auto='1'\n");
-    
-    uci_batch.push_str("set network.wan_modem6.extendprefix='1'\n");
-    uci_batch.push_str("set network.wan_modem6.defaultroute='1'\n");
-    uci_batch.push_str("set network.wan_modem6.peerdns='1'\n");
-    
-    uci_batch.push_str("commit network\n");
-    
+/// 为 MT5700M-CN 配置 IPv6，使用 DHCPv6-PD + RA Relay 模式。
+/// 
+/// 工作原理：
+///   wan_modem6（master=1）从模组通过 DHCPv6-PD 获取前缀并接收 RA，
+///   odhcpd 将 RA 和 DHCPv6 中继转发给 LAN，内网设备通过 SLAAC 自动获得真实 IPv6 地址。
+///   相比 extendprefix 模式，此方案在运营商仅下发 /64 时同样可靠。
+pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()> {
+    info!("Injecting IPv6 interface (RA Relay mode) for: {}", ifname);
+
+    // 1. 配置 wan_modem6：DHCPv6 客户端，作为 RA relay master
+    let uci_batch = format!(
+        "delete network.wan_modem6\n\
+         set network.wan_modem6=interface\n\
+         set network.wan_modem6.proto='dhcpv6'\n\
+         set network.wan_modem6.device='{ifname}'\n\
+         set network.wan_modem6.ifname='{ifname}'\n\
+         set network.wan_modem6.metric='10'\n\
+         set network.wan_modem6.reqaddress='try'\n\
+         set network.wan_modem6.reqprefix='auto'\n\
+         set network.wan_modem6.norelease='1'\n\
+         set network.wan_modem6.auto='1'\n\
+         set network.wan_modem6.defaultroute='1'\n\
+         set network.wan_modem6.peerdns='1'\n\
+         commit network\n",
+        ifname = ifname
+    );
+
     let script = format!("uci batch <<EOF\n{}EOF", uci_batch);
     if let Err(e) = run_command("sh", &["-c", &script]).await {
-        error!("Failed to inject IPv6 UCI: {}", e);
+        error!("Failed to setup wan_modem6 UCI: {}", e);
         return Err(e);
     }
-    
-    // 2. 绑定防火墙 wan_modem6
+
+    // 2. 配置 odhcpd RA Relay：wan_modem6 作为 master，lan 作为 relay 下游
+    //    master=1 表示此接口是上行（从模组接收 RA/前缀），lan 侧转发给内网设备
+    let relay_script = r#"
+        uci batch <<EOF
+set dhcp.wan_modem6=dhcp
+set dhcp.wan_modem6.interface='wan_modem6'
+set dhcp.wan_modem6.ignore='1'
+set dhcp.wan_modem6.ra='relay'
+set dhcp.wan_modem6.ndp='relay'
+set dhcp.wan_modem6.master='1'
+set dhcp.lan.ra='relay'
+set dhcp.lan.ndp='relay'
+set dhcp.lan.dhcpv6='relay'
+commit dhcp
+EOF
+    "#;
+    if let Err(e) = run_command("sh", &["-c", relay_script]).await {
+        error!("Failed to setup odhcpd relay UCI: {}", e);
+        return Err(e);
+    }
+
+    // 3. 绑定防火墙 wan zone
     let fw_script = r#"
         WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
         if [ -n "$WAN_ZONE" ]; then
@@ -144,120 +167,22 @@ pub async fn inject_ipv6_interface(config: &Config, ifname: &str) -> Result<()> 
         exit 0
     "#;
     let _ = run_command("sh", &["-c", fw_script]).await;
-    
-    // 3. 拉起 IPv6 接口
-    info!("Bringing up IPv6 interface...");
+
+    // 4. 拉起接口并重启 odhcpd
+    info!("Bringing up IPv6 interface and restarting odhcpd...");
     let _ = run_command("ifup", &["wan_modem6"]).await;
-    
-    // 4. 重载防火墙
+    // 重启 odhcpd 使 relay 配置生效
+    let _ = run_command("/etc/init.d/odhcpd", &["restart"]).await;
+
+    // 5. 重载防火墙
     if run_command("fw4", &["reload"]).await.is_err() {
         let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
     }
-    
-    info!("IPv6 injection completed.");
+
+    info!("IPv6 RA Relay injection completed.");
     Ok(())
 }
 
-pub async fn setup_modem_network(config: &Config, ifname: &str) -> Result<()> {
-
-    info!("Configuring modem network for interface: {}", ifname);
-    let net_config = &config.advanced_network_config;
-    let pdp_type = net_config.pdp_type.to_lowercase();
-    
-    info!("Network setup: ifname={}, pdp_type={}", ifname, pdp_type);
-    
-    // 使用 uci batch 批量构建命令，极大地减少系统 fork 进程的开销
-    let mut uci_batch = String::new();
-    uci_batch.push_str("delete network.wan_modem\n");
-    uci_batch.push_str("delete network.wan_modem6\n");
-    // 【新增】: 顺便清理可能残留的设备配置
-    uci_batch.push_str(&format!("delete network.dev_{}\n", ifname));
-
-    // 【新增核心代码】：显式向系统注册 5G 模块的物理设备，强制 UI 识别
-    uci_batch.push_str(&format!("set network.dev_{}=device\n", ifname));
-    uci_batch.push_str(&format!("set network.dev_{}.name='{}'\n", ifname, ifname));
-
-    if pdp_type.contains("ipv4") {
-        uci_batch.push_str("set network.wan_modem=interface\n");
-        uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
-        uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
-        uci_batch.push_str(&format!("set network.wan_modem.ifname='{}'\n", ifname));
-        uci_batch.push_str("set network.wan_modem.metric='10'\n");
-        // 【新增】极其重要！强制允许该物理接口接收 IPv6 报文(RA)
-        uci_batch.push_str("set network.wan_modem.ipv6='1'\n");
-        // 【强制显式指定】：有些版本的 LuCI 必须看到这个才会显示在概览
-        uci_batch.push_str("set network.wan_modem.delegate='0'\n");
-        uci_batch.push_str("set network.wan_modem.auto='1'\n");
-        uci_batch.push_str("set network.wan_modem.force_link='1'\n");
-        
-        if !net_config.dns_list.is_empty() {
-            uci_batch.push_str("set network.wan_modem.peerdns='0'\n");
-            for dns in &net_config.dns_list {
-                uci_batch.push_str(&format!("add_list network.wan_modem.dns='{}'\n", dns));
-            }
-        } else {
-            uci_batch.push_str("set network.wan_modem.peerdns='1'\n");
-        }
-    }
-
-    if pdp_type.contains("v6") {
-        uci_batch.push_str("set network.wan_modem6=interface\n");
-        uci_batch.push_str("set network.wan_modem6.proto='dhcpv6'\n");
-        // 使用物理接口而不是逻辑别名，提高兼容性
-        uci_batch.push_str(&format!("set network.wan_modem6.device='{}'\n", ifname));
-        uci_batch.push_str(&format!("set network.wan_modem6.ifname='{}'\n", ifname));
-        uci_batch.push_str("set network.wan_modem6.metric='10'\n");
-        
-        // 【核心修复2】：强制要求 IPv6 地址，让 odhcp6c 客户端生成完整状态供 LuCI 读取
-        uci_batch.push_str("set network.wan_modem6.reqaddress='try'\n");
-        uci_batch.push_str("set network.wan_modem6.reqprefix='auto'\n");
-        uci_batch.push_str("set network.wan_modem6.norelease='1'\n");
-        uci_batch.push_str("set network.wan_modem6.auto='1'\n");
-        
-        // 【核心修复3】：要求强制将获取到的 5G 前缀扩展委派给内网 (LAN)
-        uci_batch.push_str("set network.wan_modem6.extendprefix='1'\n");
-        uci_batch.push_str("set network.wan_modem6.defaultroute='1'\n");
-        uci_batch.push_str("set network.wan_modem6.peerdns='1'\n");
-    }
-
-    uci_batch.push_str("commit network\n");
-
-    // 将批量命令通过单个进程写入
-    let script = format!("uci batch <<EOF\n{}EOF", uci_batch);
-    if let Err(e) = run_command("sh", &["-c", &script]).await {
-        error!("Failed to batch execute UCI configuration: {}", e);
-    }
-    
-    info!("Binding modem interfaces to firewall wan zone...");
-    let fw_script = r#"
-        WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
-        if [ -n "$WAN_ZONE" ]; then
-            uci del_list firewall.$WAN_ZONE.network='wan_modem' 2>/dev/null
-            uci del_list firewall.$WAN_ZONE.network='wan_modem6' 2>/dev/null
-            uci add_list firewall.$WAN_ZONE.network='wan_modem'
-            uci add_list firewall.$WAN_ZONE.network='wan_modem6'
-            uci commit firewall
-        fi
-        
-        exit 0
-    "#;
-    let _ = run_command("sh", &["-c", fw_script]).await;
-
-    info!("Bringing up interfaces and reloading firewall...");
-    let _ = run_command("ifup", &["wan_modem"]).await;
-    if pdp_type.contains("v6") {
-        info!("Bringing up wan_modem6 (IPv6)...");
-        let _ = run_command("ifup", &["wan_modem6"]).await;
-    }
-    
-    // 统一由 OpenWrt 的 fw4 / firewall 接管重载
-    if run_command("fw4", &["reload"]).await.is_err() {
-        let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
-    }
-    
-    info!("Network configuration completed.");
-    Ok(())
-}
 
 async fn run_command(program: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(program)
