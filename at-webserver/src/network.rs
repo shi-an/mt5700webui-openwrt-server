@@ -98,42 +98,67 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     Ok(())
 }
 
-/// 为 MT5700M-CN 配置 IPv6，使用 DHCPv6-PD + RA Relay 模式。
-/// 
-/// 工作原理：
-///   wan_modem6（master=1）从模组通过 DHCPv6-PD 获取前缀并接收 RA，
-///   odhcpd 将 RA 和 DHCPv6 中继转发给 LAN，内网设备通过 SLAAC 自动获得真实 IPv6 地址。
-///   相比 extendprefix 模式，此方案在运营商仅下发 /64 时同样可靠。
+/// 为 MT5700M-CN 配置 IPv6。
+///
+/// 设计原则：尊重用户配置，只在接口不存在时写入默认值。
+/// 每次重拨只更新 device（绑定到正确网卡），其余用户自定义配置保留不变。
+/// 用户可在 LuCI 或通过 UCI 自由调整 proto/ra/dhcpv6/ndp 等参数，重拨后不会丢失。
 pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()> {
-    info!("Injecting IPv6 interface (RA Relay mode) for: {}", ifname);
+    info!("Injecting IPv6 interface for: {}", ifname);
 
-    // 1. 配置 wan_modem6：DHCPv6 客户端，作为 RA relay master
-    let uci_batch = format!(
-        "delete network.wan_modem6\n\
-         set network.wan_modem6=interface\n\
-         set network.wan_modem6.proto='dhcpv6'\n\
-         set network.wan_modem6.device='{ifname}'\n\
-         set network.wan_modem6.metric='10'\n\
-         set network.wan_modem6.force_link='1'\n\
-         set network.wan_modem6.reqaddress='try'\n\
-         set network.wan_modem6.reqprefix='auto'\n\
-         set network.wan_modem6.norelease='1'\n\
-         set network.wan_modem6.auto='1'\n\
-         set network.wan_modem6.defaultroute='1'\n\
-         set network.wan_modem6.peerdns='1'\n\
-         commit network\n",
-        ifname = ifname
-    );
+    // 1. 检查 wan_modem6 是否已存在
+    let check = tokio::process::Command::new("uci")
+        .args(&["get", "network.wan_modem6"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    let script = format!("uci batch <<EOF\n{}EOF", uci_batch);
-    if let Err(e) = run_command("sh", &["-c", &script]).await {
-        error!("Failed to setup wan_modem6 UCI: {}", e);
-        return Err(e);
+    if !check {
+        // 首次创建：写入默认配置（DHCPv6 客户端 + RA Relay master）
+        info!("wan_modem6 not found, creating with default config...");
+        let uci_batch = format!(
+            "set network.wan_modem6=interface\n\
+             set network.wan_modem6.proto='dhcpv6'\n\
+             set network.wan_modem6.device='{ifname}'\n\
+             set network.wan_modem6.metric='10'\n\
+             set network.wan_modem6.force_link='1'\n\
+             set network.wan_modem6.reqaddress='try'\n\
+             set network.wan_modem6.reqprefix='auto'\n\
+             set network.wan_modem6.norelease='1'\n\
+             set network.wan_modem6.auto='1'\n\
+             set network.wan_modem6.defaultroute='1'\n\
+             set network.wan_modem6.peerdns='1'\n\
+             commit network\n",
+            ifname = ifname
+        );
+        let script = format!("uci batch <<EOF\n{}EOF", uci_batch);
+        if let Err(e) = run_command("sh", &["-c", &script]).await {
+            error!("Failed to create wan_modem6 UCI: {}", e);
+            return Err(e);
+        }
+    } else {
+        // 已存在：只更新 device，保留用户其他配置
+        info!("wan_modem6 exists, updating device to {} only.", ifname);
+        let script = format!("uci set network.wan_modem6.device='{}' && uci commit network", ifname);
+        if let Err(e) = run_command("sh", &["-c", &script]).await {
+            error!("Failed to update wan_modem6 device: {}", e);
+            return Err(e);
+        }
     }
 
-    // 2. 配置 odhcpd RA Relay：wan_modem6 作为 master，lan 作为 relay 下游
-    //    master=1 表示此接口是上行（从模组接收 RA/前缀），lan 侧转发给内网设备
-    let relay_script = r#"
+    // 2. 检查 odhcpd 的 dhcp.wan_modem6 是否已存在，不存在才写入默认 relay 配置
+    let dhcp_check = tokio::process::Command::new("uci")
+        .args(&["get", "dhcp.wan_modem6"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !dhcp_check {
+        info!("dhcp.wan_modem6 not found, creating with default relay config...");
+        // 默认：RA Relay master 模式，用户可在 LuCI 自行调整
+        let relay_script = r#"
         uci batch <<EOF
 set dhcp.wan_modem6=dhcp
 set dhcp.wan_modem6.interface='wan_modem6'
@@ -141,15 +166,41 @@ set dhcp.wan_modem6.ignore='1'
 set dhcp.wan_modem6.ra='relay'
 set dhcp.wan_modem6.ndp='relay'
 set dhcp.wan_modem6.master='1'
+commit dhcp
+EOF
+        "#;
+        if let Err(e) = run_command("sh", &["-c", relay_script]).await {
+            error!("Failed to setup dhcp.wan_modem6: {}", e);
+            return Err(e);
+        }
+    } else {
+        info!("dhcp.wan_modem6 exists, preserving user config.");
+    }
+
+    // 3. 检查 dhcp.lan 的 relay 配置，不存在才写入默认值（保留用户修改）
+    let lan_ra = tokio::process::Command::new("uci")
+        .args(&["get", "dhcp.lan.ra"])
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if lan_ra.is_empty() {
+        info!("dhcp.lan.ra not set, applying default relay config for LAN...");
+        let lan_script = r#"
+        uci batch <<EOF
 set dhcp.lan.ra='relay'
 set dhcp.lan.ndp='relay'
 set dhcp.lan.dhcpv6='relay'
 commit dhcp
 EOF
-    "#;
-    if let Err(e) = run_command("sh", &["-c", relay_script]).await {
-        error!("Failed to setup odhcpd relay UCI: {}", e);
-        return Err(e);
+        "#;
+        if let Err(e) = run_command("sh", &["-c", lan_script]).await {
+            error!("Failed to setup dhcp.lan relay: {}", e);
+            return Err(e);
+        }
+    } else {
+        info!("dhcp.lan.ra='{}', preserving user LAN config.", lan_ra);
     }
 
     // 3. 绑定防火墙 wan zone
