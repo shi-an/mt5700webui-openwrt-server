@@ -37,27 +37,23 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     // 1. 配置物理设备 dev_xxx 和 wan_modem (IPv4)
     let mut uci_batch = String::new();
     
-    // 清理旧配置
+    // 清理旧配置（dev_xxx 对 USB 网卡无实际作用）
     uci_batch.push_str(&format!("delete network.dev_{}\n", ifname));
     uci_batch.push_str("delete network.wan_modem\n");
     
-    // 配置物理设备
-    uci_batch.push_str(&format!("set network.dev_{}=device\n", ifname));
-    uci_batch.push_str(&format!("set network.dev_{}.name='{}'\n", ifname, ifname));
-    
     // 配置 IPv4 接口
+    // OpenWrt 21+ 使用 device= 替代已废弃的 ifname=
     uci_batch.push_str("set network.wan_modem=interface\n");
     uci_batch.push_str("set network.wan_modem.proto='dhcp'\n");
     uci_batch.push_str(&format!("set network.wan_modem.device='{}'\n", ifname));
-    uci_batch.push_str(&format!("set network.wan_modem.ifname='{}'\n", ifname));
     uci_batch.push_str("set network.wan_modem.metric='10'\n");
-    
-    // 允许接收 IPv6 RA (即便只配 IPv4，物理层也要允许)
+    // force_link=1：不等待载波检测，USB 网卡必须设置否则 ifup 可能失败
+    uci_batch.push_str("set network.wan_modem.force_link='1'\n");
+    // ipv6=1：允许物理层接收 IPv6 RA
     uci_batch.push_str("set network.wan_modem.ipv6='1'\n");
-    
+    // delegate=0：前缀委派由 wan_modem6 + odhcpd 负责
     uci_batch.push_str("set network.wan_modem.delegate='0'\n");
     uci_batch.push_str("set network.wan_modem.auto='1'\n");
-    uci_batch.push_str("set network.wan_modem.force_link='1'\n");
     
     if !net_config.dns_list.is_empty() {
         uci_batch.push_str("set network.wan_modem.peerdns='0'\n");
@@ -117,8 +113,8 @@ pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()>
          set network.wan_modem6=interface\n\
          set network.wan_modem6.proto='dhcpv6'\n\
          set network.wan_modem6.device='{ifname}'\n\
-         set network.wan_modem6.ifname='{ifname}'\n\
          set network.wan_modem6.metric='10'\n\
+         set network.wan_modem6.force_link='1'\n\
          set network.wan_modem6.reqaddress='try'\n\
          set network.wan_modem6.reqprefix='auto'\n\
          set network.wan_modem6.norelease='1'\n\
