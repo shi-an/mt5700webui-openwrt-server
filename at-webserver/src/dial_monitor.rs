@@ -230,18 +230,10 @@ async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
         }
     }
 
-    // 3. 激活【上网业务通道】
+    // 3. 激活【上网业务通道】(鼎桥模组不需要 AT+QNETDEVCTL)
     info!("Activating Data Profile ID: {}", data_profile_id);
-    let qnet_cmd = format!("AT+QNETDEVCTL={},1,1", data_profile_id);
-    let _ = at_client.send_command(qnet_cmd).await;
-    
     let cgact_data_cmd = format!("AT+CGACT={},1", data_profile_id);
     let _ = at_client.send_command(cgact_data_cmd).await;
-
-    // (应对某些老固件喜欢用 0 号通道的祖传 Bug)
-    if data_profile_id == 1 {
-        let _ = at_client.send_command("AT+CGACT=1,0".to_string()).await;
-    }
 
     // 4. 激活【IMS 业务通道】(保障短信和 VoLTE)
     if let Some(ims_id) = ims_profile_id {
@@ -283,7 +275,11 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
     }
 
     if should_dial {
-        // Use existing logic for CGACT and QNETDEVCTL
+        // !!! 核心修改：在激活前，先断开鼎桥的 NDIS 绑定 !!!
+        info!("Disconnecting NDIS binding before activation...");
+        let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
+        
+        // Use existing logic for CGACT
         if let Err(e) = perform_dial(config, at_client).await {
             warn!("Dial attempt failed: {}", e);
         }
@@ -293,14 +289,28 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
     wait_for_ip(at_client).await;
 
     info!("=== Phase 3: Bind Data Channel ===");
-    // 1. 将 CID 1 的流量绑定到 NCM 网卡
+    // 1. 鼎桥专属：使用 NDISDUP 绑定指令
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
     
-    // 2. 通知 OpenWrt 系统重启 eth2 的网络接口，触发 udhcpc
-    info!("Restarting OpenWrt network interface...");
-    match Command::new("ifup").arg("wan_modem").spawn() {
-        Ok(_) => info!("Data channel bounded. Network is UP!"),
-        Err(e) => error!("Failed to bring up wan_modem: {}", e),
+    // 2. 关键：等待 2~3 秒！让模组内部的 DHCP 服务器启动就绪
+    info!("Waiting for modem DHCP server to be ready...");
+    sleep(Duration::from_secs(3)).await;
+    
+    // 3. 通知 OpenWrt 重新获取 IP（使用物理链路重启方式）
+    info!("Restarting physical link...");
+    let ifname = &config.advanced_network_config.ifname;
+    let actual_ifname = detect_modem_ifname(ifname).await;
+    
+    match Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await {
+        Ok(_) => info!("Interface {} brought down", actual_ifname),
+        Err(e) => error!("Failed to down {}: {}", actual_ifname, e),
+    }
+    
+    sleep(Duration::from_secs(1)).await;
+    
+    match Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await {
+        Ok(_) => info!("Data channel bounded. Link restarted!"),
+        Err(e) => error!("Failed to up {}: {}", actual_ifname, e),
     }
 }
 
