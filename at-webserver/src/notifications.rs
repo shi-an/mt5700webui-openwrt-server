@@ -475,4 +475,8 @@ impl NotificationManager {
         // 这里我们简单判断 enabled_push_services 是否为空
         !self.config.enabled_push_services.is_empty()
     }
+
+    pub fn memory_full_threshold(&self) -> u8 {
+        self.config.notify_memory_full_threshold
+    }
 }

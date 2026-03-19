@@ -173,6 +173,9 @@ impl MessageHandler for NewSMSHandler {
                                     Ok(sms_data) => {
                                         // Process SMS (notify & websocket broadcast)
                                         let forwarded = self.process_sms(sms_data, notifications).await;
+
+                                        // 每次新短信到达时检查存储使用率
+                                        Self::check_sms_storage(notifications, cmd_tx).await;
                                         
                                         // Only delete if enabled in config AND it was actually forwarded to a 3rd party service
                                         if self.delete_after_forward && forwarded {
@@ -303,6 +306,42 @@ impl NewSMSHandler {
         }
         
         forwarded_to_third_party
+    }
+
+    /// 查询短信存储使用率，超过阈值时发送通知
+    async fn check_sms_storage(notifications: &NotificationManager, cmd_tx: &CommandSender) {
+        let threshold = notifications.memory_full_threshold();
+        if threshold == 0 {
+            return; // 禁用
+        }
+
+        let (tx, rx) = oneshot::channel();
+        if cmd_tx.send(("AT+CPMS?".to_string(), tx)).await.is_err() {
+            return;
+        }
+        let resp = match rx.await {
+            Ok(r) if r.success => r,
+            _ => return,
+        };
+        let data = match resp.data {
+            Some(d) => d,
+            None => return,
+        };
+
+        // +CPMS: "SM",8,10,"SM",8,10,"SM",8,10
+        // 取第一组 used/total
+        let re = regex::Regex::new(r#"\+CPMS:\s*"\w+",(\d+),(\d+)"#).unwrap();
+        if let Some(caps) = re.captures(&data) {
+            let used: u32 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let total: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(1);
+            if total == 0 { return; }
+            let pct = (used * 100 / total) as u8;
+            info!("SMS storage: {}/{} ({}%)", used, total, pct);
+            if pct >= threshold {
+                let msg = format!("短信存储已使用 {}/{} ({}%)，超过阈值 {}%，请及时清理", used, total, pct, threshold);
+                notifications.notify("短信存储", &msg, crate::notifications::NotificationType::MemoryFull).await;
+            }
+        }
     }
 }
 
