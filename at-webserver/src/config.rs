@@ -123,6 +123,10 @@ pub struct AdvancedNetworkConfig {
     pub extend_prefix: bool,
     pub dns_list: Vec<String>,
     pub init_at_cmds: Vec<String>,
+    /// 短信存储位置，对应 AT+CPMS 的 mem1/mem2/mem3
+    /// 模组掉电不保存，由后端在每次启动时重新下发
+    /// 可选值："SM"（SIM卡）、"ME"（Flash）
+    pub sms_storage: String,
 }
 
 impl Default for Config {
@@ -213,6 +217,7 @@ impl Default for Config {
                 extend_prefix: true,
                 dns_list: vec![],
                 init_at_cmds: vec![],
+                sms_storage: "SM".to_string(),
             },
             sys_log_config: SysLogConfig {
                 enable: true,
@@ -412,6 +417,14 @@ impl Config {
         config.advanced_network_config.ifname = get_str("ifname", "auto");
         config.advanced_network_config.ra_master = get_bool("ra_master", true);
         config.advanced_network_config.extend_prefix = get_bool("extend_prefix", true);
+        // 短信存储位置：模组掉电不保存，由后端每次启动时通过 AT+CPMS 重新下发
+        // UCI key: at-webserver.config.sms_storage，可选值 SM / ME
+        let raw_sms = get_str("sms_storage", "SM").to_uppercase();
+        config.advanced_network_config.sms_storage = if raw_sms == "ME" {
+            "ME".to_string()
+        } else {
+            "SM".to_string() // 默认 SIM 卡
+        };
         
         // 解析列表类型的辅助函数
         let get_list = |key: &str| -> Vec<String> {

@@ -138,6 +138,12 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
                                 let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
                                 let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
+                                // 手册：AT+CPMS 的 mem3（接收存储）掉电不保存，重启后重置
+                                // mem1/mem2 上电后与上次 mem3 保持一致，因此三者都需重新下发
+                                let sms_mem = &config.advanced_network_config.sms_storage;
+                                let cpms_cmd = format!("AT+CPMS=\"{}\",\"{}\",\"{}\"", sms_mem, sms_mem, sms_mem);
+                                info!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
+                                let _ = at_client.send_command(cpms_cmd).await;
 
                                 let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
                                 info!("Auto-detected 5G interface: {}", actual_ifname);
