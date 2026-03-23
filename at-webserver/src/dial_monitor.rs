@@ -175,21 +175,19 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             }
 
                             ConnectionState::FullStackConfigured => {
-                                if !check_ping().await {
+                                if !check_router_network_status(&config).await {
                                     ping_fail_count += 1;
-                                    warn!("Ping failed in stable state. Count: {}/3", ping_fail_count);
+                                    warn!("Router-side network check failed. Count: {}/3", ping_fail_count);
                                     if ping_fail_count >= 3 {
-                                        warn!("Continuous 3 ping failures detected! Triggering disaster recovery.");
+                                        warn!("Continuous 3 router-side failures detected! Triggering disaster recovery.");
                                         trigger_disaster_recovery(&config, &at_client).await;
                                         ping_fail_count = 0;
                                         state = ConnectionState::Disconnected;
                                         continue;
                                     }
-                                } else {
-                                    if ping_fail_count > 0 {
-                                        info!("Ping recovered. Resetting failure count.");
-                                        ping_fail_count = 0;
-                                    }
+                                } else if ping_fail_count > 0 {
+                                    info!("Router-side network recovered. Resetting failure count.");
+                                    ping_fail_count = 0;
                                 }
                             }
                         }
@@ -215,31 +213,64 @@ fn log_ip_status(status: &IpStatus) {
     }
 }
 
-async fn check_ping() -> bool {
-    let output = Command::new("ping")
-        .args(&["-c", "1", "-W", "2", "223.5.5.5"])
+async fn check_router_network_status(_config: &Config) -> bool {
+    // 1) 检查 wan_modem 接口状态（路由侧）
+    let status_out = Command::new("ifstatus")
+        .arg("wan_modem")
         .output()
         .await;
 
-    match output {
-        Ok(o) if o.status.success() => {
-            debug!("Ping 223.5.5.5 success.");
-            true
-        }
+    let output = match status_out {
+        Ok(o) if o.status.success() => o,
         _ => {
-            debug!("Ping 223.5.5.5 failed, fallback to 114.114.114.114...");
-            let output2 = Command::new("ping")
-                .args(&["-c", "1", "-W", "2", "114.114.114.114"])
-                .output()
-                .await;
-            let ok = output2.map(|o| o.status.success()).unwrap_or(false);
-            if ok {
-                debug!("Ping 114.114.114.114 success.");
-            } else {
-                warn!("Both ping targets failed.");
-            }
-            ok
+            warn!("ifstatus wan_modem failed.");
+            return false;
         }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to parse ifstatus wan_modem JSON: {}", e);
+            return false;
+        }
+    };
+
+    let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !up {
+        warn!("wan_modem is down.");
+        return false;
+    }
+
+    // 2) 需要有 IPv4 地址，且有默认路由（target=0.0.0.0）
+    let has_ipv4 = v.get("ipv4-address")
+        .and_then(|x| x.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+
+    let has_default_route = v.get("route")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter().any(|r| {
+                r.get("target")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "0.0.0.0")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    if has_ipv4 && has_default_route {
+        debug!("Router-side network status OK (wan_modem up + IPv4 + default route).");
+        true
+    } else {
+        warn!(
+            "Router-side network status not ready: ipv4={}, default_route={}",
+            has_ipv4,
+            has_default_route
+        );
+        false
     }
 }
 
@@ -393,7 +424,8 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
     let _ = at_client.send_command("AT+CFUN=4".to_string()).await;
     sleep(Duration::from_secs(3)).await;
     let _ = at_client.send_command("AT+CFUN=1".to_string()).await;
-    sleep(Duration::from_secs(5)).await;
+    // CFUN=1 后模组同样会产生 URC 风暴，等待 8s 让其平息
+    sleep(Duration::from_secs(8)).await;
 
     if wait_for_cpin_ready(at_client).await {
         info!("[L2] SIM READY after radio toggle. Attempting dial...");
@@ -493,6 +525,15 @@ async fn check_registration(at_client: &ATClient) -> bool {
 
 async fn wait_for_cpin_ready(at_client: &ATClient) -> bool {
     info!("Waiting for SIM card to be READY...");
+    
+    // 【关键修复】模组在 SIM 重新识别后会连续上报大量 URC（^HCSQ、^CERSSI、
+    // ^PLMN、+C5GREG 等），持续约 3-5 秒。若此时立即发 AT+CPIN?，
+    // send_command_and_wait 的 10ms 清膛无法抽干这些 URC，导致响应被
+    // 旧 URC 污染，永远读不到 "+CPIN: READY"，造成假性超时。
+    // 静默 5 秒让 URC 风暴完全平息再开始轮询。
+    info!("Waiting 5s for URC storm to settle after SIM replug...");
+    sleep(Duration::from_secs(5)).await;
+    
     let mut retries = 0;
     let max_retries = 15; // 最多等 30 秒 (15 * 2s)
 
