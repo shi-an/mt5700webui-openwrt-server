@@ -391,81 +391,21 @@ async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
     false // 查询失败时保守处理，不阻止恢复
 }
 
-/// 四级灾难恢复入口（基于 MT5700M-CN AT命令手册）
+/// 精简灾难恢复入口（只保留最有效、最快路径）
 ///
-/// L1: AT^HVSST=1,0/1   SIM 软拔插     → SIM 接触/识别异常
-/// L2: AT+CFUN=4/1      射频 offline   → 射频/NAS 层卡死
-/// L3: AT+CGATT=0/1     PS DETACH      → EPS Bearer 卡死（注网有但无IP）
-/// L4: AT+CFUN=1,1      模组复位       → 所有软恢复失败的最后手段
+/// 快速恢复步骤：
+/// 1) 重建 NDIS 通道（AT^NDISDUP=1,0 -> AT^NDISDUP=1,1）
+/// 2) 重启路由侧网卡（ip link down/up）
+///
+/// 不再执行 HVSST/CFUN/CGATT/模组复位等慢恢复流程。
 async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
-    // ── Level-1: SIM 软拔插 ──────────────────────────────────────────────────
-    info!("[L1] SIM soft replug (AT^HVSST=1,0 -> AT^HVSST=1,1)");
-    let _ = at_client.send_command("AT^HVSST=1,0".to_string()).await;
-    sleep(Duration::from_secs(3)).await;
-    let _ = at_client.send_command("AT^HVSST=1,1".to_string()).await;
+    warn!("[FAST-RECOVERY] Rebuilding NDIS channel and restarting interface...");
 
-    if wait_for_cpin_ready(at_client).await {
-        info!("[L1] SIM READY. Attempting dial...");
-        if try_dial_and_bind(config, at_client).await {
-            return;
-        }
-        // 拨号后超时无IP：判断是否 EPS Bearer 卡死，是则直接升 L3
-        if check_registration(at_client).await {
-            warn!("[L1] Registered but no IP (EPS Bearer stuck). Escalating to L3.");
-            if level3_ps_detach(config, at_client).await { return; }
-            level4_reset(at_client).await;
-            return;
-        }
+    if try_dial_and_bind(config, at_client).await {
+        info!("[FAST-RECOVERY] Recovery succeeded.");
+    } else {
+        warn!("[FAST-RECOVERY] Recovery failed this round; will retry on next monitor cycle.");
     }
-
-    // ── Level-2: 射频 Offline/Online ─────────────────────────────────────────
-    // 手册：CFUN=0/1 间隔至少 1s；CFUN=4 = offline，CFUN=1 = online
-    warn!("[L2] Radio toggle (AT+CFUN=4 -> AT+CFUN=1)");
-    let _ = at_client.send_command("AT+CFUN=4".to_string()).await;
-    sleep(Duration::from_secs(3)).await;
-    let _ = at_client.send_command("AT+CFUN=1".to_string()).await;
-    // CFUN=1 后模组同样会产生 URC 风暴，等待 8s 让其平息
-    sleep(Duration::from_secs(8)).await;
-
-    if wait_for_cpin_ready(at_client).await {
-        info!("[L2] SIM READY after radio toggle. Attempting dial...");
-        if try_dial_and_bind(config, at_client).await {
-            return;
-        }
-        if check_registration(at_client).await {
-            warn!("[L2] Registered but no IP after radio toggle. Escalating to L3.");
-            if level3_ps_detach(config, at_client).await { return; }
-        }
-    }
-
-    // ── Level-4: 模组复位 ─────────────────────────────────────────────────────
-    level4_reset(at_client).await;
-}
-
-/// Level-3: PS 域强制 DETACH/ATTACH
-/// 手册说明：去附着时所有激活的 PDP 上下文自动失效，清除 EPS Bearer Context
-async fn level3_ps_detach(config: &Config, at_client: &ATClient) -> bool {
-    warn!("[L3] PS DETACH/ATTACH (AT+CGATT=0 -> AT+CGATT=1)");
-    let _ = at_client.send_command("AT+CGATT=0".to_string()).await;
-    sleep(Duration::from_secs(5)).await;
-    let _ = at_client.send_command("AT+CGATT=1".to_string()).await;
-    sleep(Duration::from_secs(8)).await;
-    info!("[L3] Re-dialing after PS ATTACH...");
-    try_dial_and_bind(config, at_client).await
-}
-
-/// Level-4: 模组复位
-/// 手册：AT+CFUN=1,1 在 online 模式下触发复位；AT^RESET 作为备用
-async fn level4_reset(at_client: &ATClient) {
-    error!("[L4] Modem reset (AT+CFUN=1,1)");
-    let ok = at_client.send_command("AT+CFUN=1,1".to_string()).await
-        .map(|r| r.success).unwrap_or(false);
-    if !ok {
-        warn!("[L4] AT+CFUN=1,1 failed, fallback to AT^RESET");
-        let _ = at_client.send_command("AT^RESET".to_string()).await;
-    }
-    info!("[L4] Waiting 35s for modem reboot...");
-    sleep(Duration::from_secs(35)).await;
 }
 
 /// 执行拨号并绑定数据通道，返回 true 表示成功
@@ -495,77 +435,6 @@ async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
     let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await;
     info!("[dial] Interface {} restarted. Recovery complete.", actual_ifname);
     true
-}
-
-/// 检查模组是否已注网（CS/PS 域）
-/// 返回 true 表示已注网但可能无数据承载（EPS Bearer 卡死场景）
-async fn check_registration(at_client: &ATClient) -> bool {
-    // 检查 LTE/5G PS 域注网状态
-    if let Ok(resp) = at_client.send_command("AT+CEREG?".to_string()).await {
-        if let Some(data) = resp.data {
-            // +CEREG: 0,1 或 +CEREG: 0,5 表示已注网
-            if data.contains(",1") || data.contains(",5") {
-                info!("[check_registration] CEREG: registered.");
-                return true;
-            }
-        }
-    }
-    // 回退检查 CREG
-    if let Ok(resp) = at_client.send_command("AT+CREG?".to_string()).await {
-        if let Some(data) = resp.data {
-            if data.contains(",1") || data.contains(",5") {
-                info!("[check_registration] CREG: registered.");
-                return true;
-            }
-        }
-    }
-    warn!("[check_registration] Not registered.");
-    false
-}
-
-async fn wait_for_cpin_ready(at_client: &ATClient) -> bool {
-    info!("Waiting for SIM card to be READY...");
-    
-    // 【关键修复】模组在 SIM 重新识别后会连续上报大量 URC（^HCSQ、^CERSSI、
-    // ^PLMN、+C5GREG 等），持续约 3-5 秒。若此时立即发 AT+CPIN?，
-    // send_command_and_wait 的 10ms 清膛无法抽干这些 URC，导致响应被
-    // 旧 URC 污染，永远读不到 "+CPIN: READY"，造成假性超时。
-    // 静默 5 秒让 URC 风暴完全平息再开始轮询。
-    info!("Waiting 5s for URC storm to settle after SIM replug...");
-    sleep(Duration::from_secs(5)).await;
-    
-    let mut retries = 0;
-    let max_retries = 15; // 最多等 30 秒 (15 * 2s)
-
-    loop {
-        if retries >= max_retries {
-            error!("Timeout waiting for SIM card (30s). The modem's baseband might be stuck!");
-            return false;
-        }
-
-        match at_client.send_command("AT+CPIN?".to_string()).await {
-            Ok(resp) => {
-                if let Some(data) = resp.data {
-                    let clean_data = data.replace('\n', " ").replace('\r', " ");
-                    info!("CPIN Check (Retry {}): {}", retries + 1, clean_data);
-                    if clean_data.contains("+CPIN: READY") || clean_data.contains("+CPIN:READY") {
-                        info!("SIM Card is READY.");
-                        return true;
-                    } else if clean_data.contains("ERROR") || clean_data.contains("NOT INSERTED") {
-                        warn!("Abnormal SIM state detected!");
-                    }
-                } else {
-                    warn!("CPIN returned OK but with empty data.");
-                }
-            }
-            Err(e) => {
-                error!("Failed to send AT+CPIN? command: {}", e);
-            }
-        }
-
-        retries += 1;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
 }
 
 /// 等待有效 IP，参考 QModem 增加 120 秒超时熔断
