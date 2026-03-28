@@ -218,9 +218,9 @@ impl ATClientActor {
         // 1. 先休眠：给模块 100ms 喘息时间，同时让上一条指令迟到的尾巴(如 OK)落入操作系统的接收缓存
         sleep(Duration::from_millis(100)).await;
 
-        // 2. 发射前清膛：此时休眠已结束，极其残忍地抽干缓存里的所有滞留数据
+        // 2. 发射前清膛：抽干缓存中滞留数据（200ms 窗口，覆盖 URC 风暴尾巴）
         let mut buf = [0u8; 1024];
-        while let Ok(Ok(n)) = timeout(Duration::from_millis(10), conn.receive(&mut buf)).await {
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(200), conn.receive(&mut buf)).await {
             if n == 0 { break; }
             buffer.extend_from_slice(&buf[..n]);
         }
@@ -283,10 +283,17 @@ impl ATClientActor {
                         if !expected_prefix.is_empty() && line.starts_with(expected_prefix) {
                             is_my_response = true;
                         }
-                        
-                        // 3. 【切断死循环核心】：如果是 URC，且"不是我主动查的响应"，才去广播
-                        if Self::is_urc(handlers, &line) && !is_my_response {
-                            let _ = urc_tx.send(line.clone()).await;
+
+                        // URC bypass: lines starting with ^ or + that are not this command's response
+                        let is_urc_line = !is_my_response
+                            && (line.starts_with('^') || line.starts_with('+'))
+                            && line != "OK"
+                            && !line.contains("ERROR");
+
+                        if is_urc_line {
+                            if Self::is_urc(handlers, &line) {
+                                let _ = urc_tx.send(line.clone()).await;
+                            }
                             if let Some(tx) = crate::server::WS_BROADCASTER.get() {
                                 let ws_msg = serde_json::json!({
                                     "type": "raw_data",
@@ -294,7 +301,7 @@ impl ATClientActor {
                                 }).to_string();
                                 let _ = tx.send(ws_msg);
                             }
-                            continue; // 广播完直接跳过，不要混进本次回应里
+                            continue;
                         }
                         // 正常的查询结果，精准拼装
                         if line == "OK" {
