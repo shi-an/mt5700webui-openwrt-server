@@ -220,15 +220,15 @@ impl ATClientActor {
 
         // 2. 发射前清膛：此时休眠已结束，极其残忍地抽干缓存里的所有滞留数据
         let mut buf = [0u8; 1024];
-        while let Ok(Ok(n)) = timeout(Duration::from_millis(200), conn.receive(&mut buf)).await {
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(10), conn.receive(&mut buf)).await {
             if n == 0 { break; }
             buffer.extend_from_slice(&buf[..n]);
         }
         
         // 悄悄处理掉滞留数据里可能混杂的有用 URC（如短信），但绝不触发网页全局刷新
         while let Some(line) = extract_next_line(buffer) {
-            if let Some(priority) = Self::urc_priority(handlers, &line) {
-                Self::enqueue_urc(urc_tx, &line, priority).await;
+            if Self::is_urc(handlers, &line) {
+                let _ = urc_tx.send(line).await;
             }
         }
         
@@ -284,19 +284,17 @@ impl ATClientActor {
                             is_my_response = true;
                         }
                         
-                        // URC 判定（白名单 + 优先级），不是本命令响应就分流
-                        if let Some(priority) = Self::urc_priority(handlers, &line) {
-                            if !is_my_response {
-                                Self::enqueue_urc(urc_tx, &line, priority).await;
-                                if let Some(tx) = crate::server::WS_BROADCASTER.get() {
-                                    let ws_msg = serde_json::json!({
-                                        "type": "raw_data",
-                                        "data": line
-                                    }).to_string();
-                                    let _ = tx.send(ws_msg);
-                                }
-                                continue; // URC 不混入命令响应
+                        // 3. 【切断死循环核心】：如果是 URC，且"不是我主动查的响应"，才去广播
+                        if Self::is_urc(handlers, &line) && !is_my_response {
+                            let _ = urc_tx.send(line.clone()).await;
+                            if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                                let ws_msg = serde_json::json!({
+                                    "type": "raw_data",
+                                    "data": line
+                                }).to_string();
+                                let _ = tx.send(ws_msg);
                             }
+                            continue; // 广播完直接跳过，不要混进本次回应里
                         }
                         // 正常的查询结果，精准拼装
                         if line == "OK" {
@@ -347,9 +345,9 @@ impl ATClientActor {
     ) {
          while let Some(line) = extract_next_line(buffer) {
              debug!("URC/Idle: {}", line);
-             if let Some(priority) = Self::urc_priority(handlers, &line) {
-                 Self::enqueue_urc(urc_tx, &line, priority).await;
-                 // 只有 URC 才全局广播，避免触发前端死循环
+             if Self::is_urc(handlers, &line) {
+                 let _ = urc_tx.send(line.clone()).await;
+                 // 【修复】：只有真正的 URC 才全局广播，避免触发前端死循环
                  if let Some(tx) = crate::server::WS_BROADCASTER.get() {
                      let _ = tx.send(serde_json::json!({"type": "raw_data", "data": line}).to_string());
                  }
@@ -357,59 +355,12 @@ impl ATClientActor {
          }
     }
 
-    fn urc_priority(handlers: &[Box<dyn MessageHandler>], line: &str) -> Option<u8> {
-        // 高优先级：业务/链路关键事件，不能丢
-        const HIGH: &[&str] = &[
-            "+CMTI:", "+CMT:", "+CDSI:", "+CDS:",
-            "RING", "+CRING:", "+CLIP:",
-            "^NDISSTAT:", "^NDISSTATEX:",
-            "^SIMSQ:", "^SIMST:", "^USIMICCID:", "^CPBREADY",
-            "+CREG:", "+CGREG:", "+CEREG:", "+C5GREG:", "+CIREGU:",
-        ];
-
-        // 中优先级：状态类
-        const MID: &[&str] = &[
-            "^SRVST:", "^PLMN:", "^IMSSRVSTATUS:", "^NWTIME:", "^DSAMBR:", "+CIEV:",
-        ];
-
-        // 低优先级：高频信号类（风暴源）
-        const LOW: &[&str] = &["^HCSQ:", "^RSSI:", "^CERSSI:"];
-
-        if HIGH.iter().any(|p| line.starts_with(p)) {
-            return Some(3);
-        }
-        if MID.iter().any(|p| line.starts_with(p)) {
-            return Some(2);
-        }
-        if LOW.iter().any(|p| line.starts_with(p)) {
-            return Some(1);
-        }
-
-        // 兼容已有 handler 判定（防止漏掉项目内自定义 URC）
+    fn is_urc(handlers: &[Box<dyn MessageHandler>], line: &str) -> bool {
         for handler in handlers {
-            if handler.can_handle(line) {
-                return Some(2);
-            }
+            if handler.can_handle(line) { return true; }
         }
-
-        None
+        false
     }
-
-    async fn enqueue_urc(urc_tx: &mpsc::Sender<String>, line: &str, priority: u8) {
-        match urc_tx.try_send(line.to_string()) {
-            Ok(_) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // 高优先级不丢；中低优先级在风暴时允许丢弃
-                if priority >= 3 {
-                    let _ = urc_tx.send(line.to_string()).await;
-                } else {
-                    debug!("Drop low/mid URC due to full queue: {}", line);
-                }
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-        }
-    }
-
 }
 
 fn extract_next_line(buffer: &mut Vec<u8>) -> Option<String> {
