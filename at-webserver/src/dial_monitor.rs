@@ -76,7 +76,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
         if ndis_disconnected {
             // 检查用户是否手动关闭了自动拨号，若关闭则不进行灾难恢复
             if is_auto_dial_disabled(&at_client).await {
-                info!("[monitor] NDIS disconnected but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
+                debug!("[monitor] NDIS disconnected but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
                 state = ConnectionState::Disconnected;
                 ping_fail_count = 0;
                 unexpected_response_count = 0;
@@ -111,7 +111,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         unexpected_response_count = 0;
                         // 检查用户是否手动关闭了自动拨号，若关闭则不触发灾难恢复
                         if is_auto_dial_disabled(&at_client).await {
-                            info!("[monitor] No IP but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
+                            debug!("[monitor] No IP but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
                             state = ConnectionState::Disconnected;
                             continue;
                         }
@@ -134,7 +134,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             ConnectionState::Disconnected => {
                                 info!("IP address detected. Starting network setup...");
 
-                                info!("Initializing modem URC reporting configs...");
+                                debug!("Initializing modem URC reporting configs...");
                                 let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
                                 let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
                                 let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
@@ -142,16 +142,16 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 // mem1/mem2 上电后与上次 mem3 保持一致，因此三者都需重新下发
                                 let sms_mem = &config.advanced_network_config.sms_storage;
                                 let cpms_cmd = format!("AT+CPMS=\"{}\",\"{}\",\"{}\"", sms_mem, sms_mem, sms_mem);
-                                info!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
+                                debug!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
                                 let _ = at_client.send_command(cpms_cmd).await;
 
                                 let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
-                                info!("Auto-detected 5G interface: {}", actual_ifname);
+                                debug!("Auto-detected 5G interface: {}", actual_ifname);
 
                                 if let Err(e) = network::setup_ipv4_only(&config, &actual_ifname).await {
                                     error!("Failed to setup IPv4 network: {}", e);
                                 } else {
-                                    info!("IPv4 setup done.");
+                                    debug!("IPv4 setup done.");
                                 }
 
                                 let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
@@ -165,7 +165,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                     if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
                                         error!("Failed to inject IPv6 interface: {}", e);
                                     } else {
-                                        info!("IPv6 Injection Completed.");
+                                        debug!("IPv6 Injection Completed.");
                                     }
                                 }
 
@@ -186,7 +186,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                         continue;
                                     }
                                 } else if ping_fail_count > 0 {
-                                    info!("Router-side network recovered. Resetting failure count.");
+                                    debug!("Router-side network recovered. Resetting failure count.");
                                     ping_fail_count = 0;
                                 }
                             }

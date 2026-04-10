@@ -234,7 +234,7 @@ async fn handle_client(
                              continue;
                          }
 
-                         log::info!("WS Command: {}", cmd_str);
+                         log::debug!("WS Command: {}", cmd_str);
 
                          // 【新增】：哪怕前端包装成 JSON，只要解析出来是 ping，直接秒回 pong，绝不麻烦硬件！
                          if cmd_str.trim() == "ping" || cmd_str.trim().to_lowercase() == "keepalive" {
@@ -375,7 +375,7 @@ async fn handle_client(
             else => break,
         }
     }
-    info!("WebSocket client disconnected");
+    debug!("WebSocket client disconnected");
     if let Some(ip) = client_ip {
         if let Some(conns) = CLIENT_CONNECTIONS.get() {
             let mut conns = conns.lock().await;

@@ -1,12 +1,12 @@
 use crate::config::Config;
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, debug};
 use tokio::process::Command;
 
 
 // 【新增】启动时清理环境，确保无残留配置
 pub async fn clean_startup_state() -> Result<()> {
-    info!("Performing startup cleanup...");
+    debug!("Performing startup cleanup...");
     let cleanup_script = r#"
         uci -q delete network.wan_modem
         uci -q delete network.wan_modem6
@@ -26,12 +26,12 @@ pub async fn clean_startup_state() -> Result<()> {
         exit 0
     "#;
     let _ = run_command("sh", &["-c", cleanup_script]).await;
-    info!("Startup cleanup completed.");
+    debug!("Startup cleanup completed.");
     Ok(())
 }
 
 pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
-    info!("Setting up IPv4 ONLY for interface: {}", ifname);
+    debug!("Setting up IPv4 ONLY for interface: {}", ifname);
     let net_config = &config.advanced_network_config;
     
     // 1. 配置物理设备 dev_xxx 和 wan_modem (IPv4)
@@ -86,7 +86,7 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     let _ = run_command("sh", &["-c", fw_script]).await;
     
     // 3. 拉起接口
-    info!("Bringing up IPv4 interface...");
+    debug!("Bringing up IPv4 interface...");
     let _ = run_command("ifup", &["wan_modem"]).await;
     
     // 4. 重载防火墙
@@ -94,7 +94,7 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
         let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
     }
     
-    info!("IPv4 network setup completed.");
+    debug!("IPv4 network setup completed.");
     Ok(())
 }
 
@@ -104,7 +104,7 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
 /// 每次重拨只更新 device（绑定到正确网卡），其余用户自定义配置保留不变。
 /// 用户可在 LuCI 或通过 UCI 自由调整 proto/ra/dhcpv6/ndp 等参数，重拨后不会丢失。
 pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()> {
-    info!("Injecting IPv6 interface for: {}", ifname);
+    debug!("Injecting IPv6 interface for: {}", ifname);
 
     // 1. 检查 wan_modem6 是否已存在
     let check = tokio::process::Command::new("uci")
@@ -116,7 +116,7 @@ pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()>
 
     if !check {
         // 首次创建：写入默认配置（DHCPv6 客户端 + RA Relay master）
-        info!("wan_modem6 not found, creating with default config...");
+        debug!("wan_modem6 not found, creating with default config...");
         let uci_batch = format!(
             "set network.wan_modem6=interface\n\
              set network.wan_modem6.proto='dhcpv6'\n\
@@ -139,7 +139,7 @@ pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()>
         }
     } else {
         // 已存在：只更新 device，保留用户其他配置
-        info!("wan_modem6 exists, updating device to {} only.", ifname);
+        debug!("wan_modem6 exists, updating device to {} only.", ifname);
         let script = format!("uci set network.wan_modem6.device='{}' && uci commit network", ifname);
         if let Err(e) = run_command("sh", &["-c", &script]).await {
             error!("Failed to update wan_modem6 device: {}", e);
@@ -156,7 +156,7 @@ pub async fn inject_ipv6_interface(_config: &Config, ifname: &str) -> Result<()>
         .unwrap_or(false);
 
     if !dhcp_check {
-        info!("dhcp.wan_modem6 not found, creating with default relay config...");
+        debug!("dhcp.wan_modem6 not found, creating with default relay config...");
         // 默认：RA Relay master 模式，用户可在 LuCI 自行调整
         let relay_script = r#"
         uci batch <<EOF
@@ -174,7 +174,7 @@ EOF
             return Err(e);
         }
     } else {
-        info!("dhcp.wan_modem6 exists, preserving user config.");
+        debug!("dhcp.wan_modem6 exists, preserving user config.");
     }
 
     // 3. 检查 dhcp.lan 的 relay 配置，不存在才写入默认值（保留用户修改）
@@ -186,7 +186,7 @@ EOF
         .unwrap_or_default();
 
     if lan_ra.is_empty() {
-        info!("dhcp.lan.ra not set, applying default relay config for LAN...");
+        debug!("dhcp.lan.ra not set, applying default relay config for LAN...");
         let lan_script = r#"
         uci batch <<EOF
 set dhcp.lan.ra='relay'
@@ -200,7 +200,7 @@ EOF
             return Err(e);
         }
     } else {
-        info!("dhcp.lan.ra='{}', preserving user LAN config.", lan_ra);
+        debug!("dhcp.lan.ra='{}', preserving user LAN config.", lan_ra);
     }
 
     // 3. 绑定防火墙 wan zone
@@ -216,7 +216,7 @@ EOF
     let _ = run_command("sh", &["-c", fw_script]).await;
 
     // 4. 拉起接口并重启 odhcpd
-    info!("Bringing up IPv6 interface and restarting odhcpd...");
+    debug!("Bringing up IPv6 interface and restarting odhcpd...");
     let _ = run_command("ifup", &["wan_modem6"]).await;
     // 重启 odhcpd 使 relay 配置生效
     let _ = run_command("/etc/init.d/odhcpd", &["restart"]).await;
@@ -226,7 +226,7 @@ EOF
         let _ = run_command("/etc/init.d/firewall", &["reload"]).await;
     }
 
-    info!("IPv6 RA Relay injection completed.");
+    debug!("IPv6 RA Relay injection completed.");
     Ok(())
 }
 

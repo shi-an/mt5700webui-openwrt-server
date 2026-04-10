@@ -1,7 +1,7 @@
 use crate::config::NotificationConfig;
 use anyhow::Result;
 use async_trait::async_trait;
-use log::{error, info, warn};
+use log::{error, info, warn, debug};
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -350,62 +350,62 @@ impl NotificationManager {
                 "wechat" => {
                     if let Some(url) = &config.wechat_webhook {
                         channels.push(Box::new(WeChatWork { webhook: url.clone(), client: client.clone() }));
-                        info!("已启用 企业微信 推送");
+                        debug!("已启用 企业微信 推送");
                     }
                 },
                 "pushplus" => {
                     if let Some(token) = &config.pushplus_token {
                         channels.push(Box::new(PushPlus { token: token.clone(), client: client.clone() }));
-                        info!("已启用 PushPlus 推送");
+                        debug!("已启用 PushPlus 推送");
                     }
                 },
                 "serverchan" => {
                     if let Some(key) = &config.serverchan_key {
                         channels.push(Box::new(ServerChan { key: key.clone(), client: client.clone() }));
-                        info!("已启用 Server酱 推送");
+                        debug!("已启用 Server酱 推送");
                     }
                 },
                 "pushdeer" => {
                     if let Some(key) = &config.pushdeer_key {
                         let url = config.pushdeer_url.clone().unwrap_or_default();
                         channels.push(Box::new(PushDeer { key: key.clone(), url, client: client.clone() }));
-                        info!("已启用 PushDeer 推送");
+                        debug!("已启用 PushDeer 推送");
                     }
                 },
                 "feishu" => {
                     if let Some(url) = &config.feishu_webhook {
                         channels.push(Box::new(Feishu { webhook: url.clone(), client: client.clone() }));
-                        info!("已启用 飞书 推送");
+                        debug!("已启用 飞书 推送");
                     }
                 },
                 "dingtalk" => {
                     if let Some(url) = &config.dingtalk_webhook {
                         channels.push(Box::new(DingTalk { webhook: url.clone(), _secret: config.dingtalk_secret.clone(), client: client.clone() }));
-                        info!("已启用 钉钉 推送");
+                        debug!("已启用 钉钉 推送");
                     }
                 },
                 "bark" => {
                     if let Some(url) = &config.bark_url {
                         channels.push(Box::new(Bark { url: url.clone(), client: client.clone() }));
-                        info!("已启用 Bark 推送");
+                        debug!("已启用 Bark 推送");
                     }
                 },
                 "telegram" => {
                     if let (Some(token), Some(chat_id)) = (&config.tg_bot_token, &config.tg_chat_id) {
                         channels.push(Box::new(Telegram { token: token.clone(), chat_id: chat_id.clone(), client: client.clone() }));
-                        info!("已启用 Telegram 推送");
+                        debug!("已启用 Telegram 推送");
                     }
                 },
                 "generic" => {
                     if let Some(url) = &config.generic_webhook_url {
                         channels.push(Box::new(GenericWebhook { url: url.clone(), client: client.clone() }));
-                        info!("已启用 通用Webhook 推送");
+                        debug!("已启用 通用Webhook 推送");
                     }
                 },
                 "custom" => {
                     if let Some(path) = &config.custom_script_path {
                         channels.push(Box::new(CustomScript { path: path.clone() }));
-                        info!("已启用 自定义脚本 推送");
+                        debug!("已启用 自定义脚本 推送");
                     }
                 },
                 _ => {}

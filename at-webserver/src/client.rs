@@ -236,11 +236,7 @@ impl ATClientActor {
         buffer.clear();
 
         let clean_cmd = cmd.trim();
-        if clean_cmd == "AT+CGPADDR" {
-            debug!("Sending Command: {}", clean_cmd);
-        } else {
-            info!("Sending Command: {}", clean_cmd);
-        }
+        debug!("Sending Command: {}", clean_cmd);
         
         // 智能提取当前查询的期望前缀
         let expected_prefix = if clean_cmd.starts_with("AT") {
