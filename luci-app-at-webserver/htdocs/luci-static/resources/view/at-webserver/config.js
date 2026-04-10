@@ -314,6 +314,14 @@ return view.extend({
 		o.default = '0';
 		o.depends('sys_log_enable', '1');
 
+		o = s.taboption('notify', form.ListValue, 'sys_log_level', _('日志等级'), _('选择写入系统日志的最低详细程度。Info 仅保留必要运行信息，Debug 用于排障。'));
+		o.value('error', _('错误'));
+		o.value('warn', _('警告'));
+		o.value('info', _('信息（推荐）'));
+		o.value('debug', _('调试'));
+		o.default = 'info';
+		o.depends('sys_log_enable', '1');
+
 		// ---------------------------------------------------------
 		// 事件通知触发条件
 		// ---------------------------------------------------------

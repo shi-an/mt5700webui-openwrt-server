@@ -1,4 +1,5 @@
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
 use chrono::Local;
@@ -11,6 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 static LOGGER: OnceLock<AppLogger> = OnceLock::new();
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(3);
 static LOG_CHANNEL: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 static FILE_CHANNEL: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 
@@ -18,7 +20,13 @@ pub struct AppLogger;
 
 impl Log for AppLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        let level = match LOG_LEVEL.load(Ordering::Relaxed) {
+            1 => LevelFilter::Error,
+            2 => LevelFilter::Warn,
+            4 => LevelFilter::Debug,
+            _ => LevelFilter::Info,
+        };
+        metadata.level() <= level.to_level().unwrap_or(Level::Info)
     }
 
     fn log(&self, record: &Record) {
@@ -49,9 +57,17 @@ pub fn init(config: &Config) -> broadcast::Receiver<String> {
     let (tx, rx) = broadcast::channel(100);
     LOG_CHANNEL.set(tx).expect("Failed to set log channel");
 
+    let level = match config.sys_log_config.level.as_str() {
+        "error" => 1,
+        "warn" => 2,
+        "debug" => 4,
+        _ => 3,
+    };
+    LOG_LEVEL.store(level, Ordering::Relaxed);
+
     // Initialize logger
     let logger = LOGGER.get_or_init(|| AppLogger);
-    log::set_logger(logger).map(|()| log::set_max_level(LevelFilter::Info)).expect("Failed to set logger");
+    log::set_logger(logger).map(|()| log::set_max_level(LevelFilter::Debug)).expect("Failed to set logger");
 
     // Start background thread if logging is enabled
     if config.sys_log_config.enable {

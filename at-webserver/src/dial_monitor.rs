@@ -440,7 +440,7 @@ async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
 /// 等待有效 IP，参考 QModem 增加 120 秒超时熔断
 /// 返回 true 表示成功获取 IP，false 表示超时
 async fn wait_for_ip(at_client: &ATClient) -> bool {
-    info!("Waiting for valid IP address (timeout: 120s)...");
+    debug!("Waiting for valid IP address (timeout: 120s)...");
     let max_retries = 60u32; // 60 * 2s = 120s
     let mut retries = 0u32;
 
@@ -451,7 +451,7 @@ async fn wait_for_ip(at_client: &ATClient) -> bool {
         }
         match check_ip_status(at_client).await {
             Ok(status) if status.has_ip() => {
-                info!("IP successfully obtained.");
+                debug!("IP successfully obtained.");
                 return true;
             }
             Ok(IpStatus::Unexpected) => {

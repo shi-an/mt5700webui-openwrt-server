@@ -1,6 +1,6 @@
 use crate::models::ConnectionType;
 use std::process::Command;
-use log::{info, error};
+use log::{debug, info, error};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,7 @@ pub struct Config {
 pub struct SysLogConfig {
     pub enable: bool,
     pub persist: bool,
+    pub level: String,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,7 @@ impl Default for Config {
             sys_log_config: SysLogConfig {
                 enable: true,
                 persist: false,
+                level: "info".to_string(),
             },
         }
     }
@@ -234,7 +236,7 @@ impl Config {
         let mut config = Config::default();
         let mut uci_data = HashMap::new();
 
-        info!("Loading configuration from UCI...");
+        debug!("Loading configuration from UCI...");
 
         // Run `uci show at-webserver`
         match Command::new("uci").args(&["show", "at-webserver"]).output() {
@@ -448,6 +450,11 @@ impl Config {
         // SysLog Config
         config.sys_log_config.enable = get_bool("sys_log_enable", true);
         config.sys_log_config.persist = get_bool("sys_log_persist", false);
+        let raw_level = get_str("sys_log_level", "info").to_lowercase();
+        config.sys_log_config.level = match raw_level.as_str() {
+            "error" | "warn" | "info" | "debug" => raw_level,
+            _ => "info".to_string(),
+        };
         // config.sys_log_config.path_temp = get_str("sys_log_path_temp", "/tmp/at-webserver.log");
         // config.sys_log_config.path_persist = get_str("sys_log_path_persist", "/etc/at-webserver.log");
 
@@ -469,7 +476,7 @@ impl Config {
         }
         // if let Ok(val) = std::env::var("AT_LOG_FILE") { config.notification_config.log_file = Some(val); }
 
-        info!("Loaded configuration: {:?}", config);
+        debug!("Loaded configuration: {:?}", config);
         config
     }
 }
