@@ -278,13 +278,22 @@ async fn handle_client(
                          if let Some(kv) = cmd_str.trim().strip_prefix("SET_CONFIG:") {
                              if let Some((key, value)) = kv.split_once('=') {
                                  let key = key.trim().to_string();
-                                 let value = value.trim().to_string();
+                                 let value = value.trim().to_uppercase();
                                  // 白名单：只允许保存已知的配置 key，防止注入
                                  let allowed_keys = [
                                      "sms_storage",
                                  ];
+                                 let normalized_value = if key == "sms_storage" {
+                                     match value.as_str() {
+                                         "ME" => "ME".to_string(),
+                                         _ => "SM".to_string(),
+                                     }
+                                 } else {
+                                     value.clone()
+                                 };
+
                                  let success = if allowed_keys.contains(&key.as_str()) {
-                                     let uci_key = format!("at-webserver.config.{}={}", key, value);
+                                     let uci_key = format!("at-webserver.config.{}={}", key, normalized_value);
                                      let set_ok = std::process::Command::new("uci")
                                          .args(&["set", &uci_key])
                                          .status()
@@ -303,10 +312,45 @@ async fn handle_client(
                                      warn!("SET_CONFIG: key '{}' not in allowlist, rejected", key);
                                      false
                                  };
+
+                                 let mut apply_error: Option<String> = None;
+                                 if success && key == "sms_storage" {
+                                     let cpms_cmd = format!(
+                                         "AT+CPMS=\"{}\",\"{}\",\"{}\"",
+                                         normalized_value, normalized_value, normalized_value
+                                     );
+                                     let (apply_tx, apply_rx) = oneshot::channel();
+                                     if sender.send((cpms_cmd.clone(), apply_tx)).await.is_err() {
+                                         apply_error = Some("Failed to send AT+CPMS command".to_string());
+                                     } else {
+                                         match apply_rx.await {
+                                             Ok(resp) if resp.success => {
+                                                 info!("sms_storage applied immediately via {}", cpms_cmd);
+                                             }
+                                             Ok(resp) => {
+                                                 apply_error = Some(resp.error.unwrap_or_else(|| "AT+CPMS failed".to_string()));
+                                             }
+                                             Err(_) => {
+                                                 apply_error = Some("Failed to receive AT+CPMS response".to_string());
+                                             }
+                                         }
+                                     }
+                                 }
+
                                  let resp = WSResponse {
-                                     success,
-                                     data: if success { Some(format!("{}={} saved", key, value)) } else { None },
-                                     error: if success { None } else { Some(format!("Failed to save {}", key)) },
+                                     success: success && apply_error.is_none(),
+                                     data: if success && apply_error.is_none() {
+                                         Some(format!("{}={} saved and applied", key, normalized_value))
+                                     } else if success {
+                                         Some(format!("{}={} saved", key, normalized_value))
+                                     } else {
+                                         None
+                                     },
+                                     error: if !success {
+                                         Some(format!("Failed to save {}", key))
+                                     } else {
+                                         apply_error
+                                     },
                                  };
                                  let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&resp).unwrap())).await;
                              }
