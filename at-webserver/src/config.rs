@@ -67,6 +67,7 @@ pub struct NotificationConfig {
     /// 信号强度（RSRP dBm 绝对值）低于此值时通知（0=禁用）
     pub notify_signal_threshold: i32,
     pub sms_delete_after_forward: bool,
+    pub delete_mms_notification: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,7 @@ impl Default for Config {
                 notify_memory_full_threshold: 90,
                 notify_signal_threshold: 0,
                 sms_delete_after_forward: false,
+                delete_mms_notification: false,
             },
             websocket_config: WebSocketConfig {
                 ipv4: IpConfig {
@@ -375,6 +377,7 @@ impl Config {
         config.notification_config.notify_memory_full_threshold = get_u8("notify_memory_full_threshold", 90);
         config.notification_config.notify_signal_threshold = uci_data.get("notify_signal_threshold").and_then(|s| s.parse().ok()).unwrap_or(0);
         config.notification_config.sms_delete_after_forward = get_bool("sms_delete_after_forward", false);
+        config.notification_config.delete_mms_notification = get_bool("delete_mms_notification", false);
 
         // WebSocket Config
         let ws_port = get_u16("websocket_port", 8765);

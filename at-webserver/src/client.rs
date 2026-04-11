@@ -68,7 +68,10 @@ impl ATClientActor {
             let mut async_handlers: Vec<Box<dyn MessageHandler>> = vec![
                 Box::new(CallHandler),
                 Box::new(MemoryFullHandler),
-                Box::new(NewSMSHandler::new(config.notification_config.sms_delete_after_forward)),
+                Box::new(NewSMSHandler::new(
+                    config.notification_config.sms_delete_after_forward,
+                    config.notification_config.delete_mms_notification,
+                )),
                 Box::new(NdisStatHandler),
                 Box::new(PDCPDataHandler),
                 Box::new(NetworkSignalHandler::new()),
@@ -85,7 +88,10 @@ impl ATClientActor {
         let handlers: Vec<Box<dyn MessageHandler>> = vec![
             Box::new(CallHandler),
             Box::new(MemoryFullHandler),
-            Box::new(NewSMSHandler::new(config.notification_config.sms_delete_after_forward)),
+            Box::new(NewSMSHandler::new(
+                config.notification_config.sms_delete_after_forward,
+                config.notification_config.delete_mms_notification,
+            )),
             Box::new(NdisStatHandler),
             Box::new(PDCPDataHandler),
             Box::new(NetworkSignalHandler::new()),

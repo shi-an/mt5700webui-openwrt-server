@@ -350,6 +350,10 @@ return view.extend({
 		o.default = '0';
 		o.depends('notify_sms', '1');
 
+		o = s.taboption('notify', form.Flag, 'delete_mms_notification', _('识别彩信通知后自动删除'), _('启用后，识别到 WAP Push / MMS 通知短信时，将在解析后自动从短信存储中删除。默认关闭。'));
+		o.default = '0';
+		o.depends('notify_sms', '1');
+
 		o = s.taboption('notify', form.Value, 'notify_signal_threshold', _('信号通知阈值'), _('RSRP 低于 -N dBm 时发送通知（0=禁用，推荐 100 表示低于 -100 dBm 时通知）'));
 		o.datatype = 'uinteger';
 

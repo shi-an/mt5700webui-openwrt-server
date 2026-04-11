@@ -1,6 +1,6 @@
 use crate::models::CommandSender;
 use crate::notifications::{NotificationManager, NotificationType};
-use crate::pdu::{read_incoming_sms, SmsData};
+use crate::pdu::{read_incoming_sms, IncomingMessage, SmsData};
 use anyhow::Result;
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
@@ -115,11 +115,12 @@ fn get_partial_cache() -> PartialSmsCache {
 
 pub struct NewSMSHandler {
     delete_after_forward: bool,
+    delete_mms_notification: bool,
 }
 
 impl NewSMSHandler {
-    pub fn new(delete_after_forward: bool) -> Self {
-        Self { delete_after_forward }
+    pub fn new(delete_after_forward: bool, delete_mms_notification: bool) -> Self {
+        Self { delete_after_forward, delete_mms_notification }
     }
 }
 
@@ -170,7 +171,7 @@ impl MessageHandler for NewSMSHandler {
 
                             if !pdu_hex.is_empty() {
                                 match read_incoming_sms(pdu_hex) {
-                                    Ok(sms_data) => {
+                                    Ok(IncomingMessage::Sms(sms_data)) => {
                                         // Process SMS (notify & websocket broadcast)
                                         let forwarded = self.process_sms(sms_data, notifications).await;
 
@@ -186,6 +187,35 @@ impl MessageHandler for NewSMSHandler {
                                             let _ = del_rx.await;
                                         } else {
                                             info!("Keeping SMS at index {} (auto-delete disabled or not forwarded)", index);
+                                        }
+                                    }
+                                    Ok(IncomingMessage::MmsNotification(mms)) => {
+                                        warn!("Detected MMS notification at index {} from {}", index, mms.sender);
+
+                                        if let Some(tx) = crate::server::WS_BROADCASTER.get() {
+                                            let msg = serde_json::json!({
+                                                "type": "new_mms_notification",
+                                                "data": {
+                                                    "sender": mms.sender,
+                                                    "contentLocation": mms.content_location,
+                                                    "transactionId": mms.transaction_id,
+                                                    "contentType": mms.content_type,
+                                                    "time": mms.date,
+                                                }
+                                            }).to_string();
+                                            let _ = tx.send(msg);
+                                        }
+
+                                        Self::check_sms_storage(notifications, cmd_tx).await;
+
+                                        if self.delete_mms_notification {
+                                            info!("Deleting MMS notification at index {}", index);
+                                            let del_cmd = format!("AT+CMGD={}", index);
+                                            let (del_tx, del_rx) = oneshot::channel();
+                                            let _ = cmd_tx.send((del_cmd, del_tx)).await;
+                                            let _ = del_rx.await;
+                                        } else {
+                                            info!("Keeping MMS notification at index {} (auto-delete disabled)", index);
                                         }
                                     }
                                     Err(e) => {
