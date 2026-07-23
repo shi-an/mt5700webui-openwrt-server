@@ -4,6 +4,10 @@ use crate::handlers::{CallHandler, MemoryFullHandler, MessageHandler, NetworkSig
 use crate::models::{ATResponse, CommandSender, ConnectionType};
 use crate::notifications::NotificationManager;
 use log::{error, info, warn, debug};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
@@ -11,23 +15,39 @@ use tokio::time::{sleep, timeout};
 #[derive(Clone)]
 pub struct ATClient {
     tx: CommandSender,
+    connection_generation: Arc<AtomicU64>,
 }
 
 impl ATClient {
     pub fn new(config: Config, notifications: NotificationManager) -> Self {
         let (tx, rx) = mpsc::channel(32);
         let tx_clone = tx.clone();
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let actor_generation = Arc::clone(&connection_generation);
         
         tokio::spawn(async move {
-            let mut actor = ATClientActor::new(config, notifications, rx, tx_clone);
+            let mut actor = ATClientActor::new(
+                config,
+                notifications,
+                rx,
+                tx_clone,
+                actor_generation,
+            );
             actor.run().await;
         });
 
-        Self { tx }
+        Self {
+            tx,
+            connection_generation,
+        }
     }
 
     pub fn get_sender(&self) -> CommandSender {
         self.tx.clone()
+    }
+
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Relaxed)
     }
 
     pub async fn send_command(&self, cmd: String) -> anyhow::Result<ATResponse> {
@@ -49,6 +69,7 @@ struct ATClientActor {
     cmd_tx: CommandSender,
     buffer: Vec<u8>,
     urc_tx: mpsc::Sender<String>, // 新增专门用于分发 URC 的通道
+    connection_generation: Arc<AtomicU64>,
 }
 
 impl ATClientActor {
@@ -57,6 +78,7 @@ impl ATClientActor {
         notifications: NotificationManager, 
         rx: mpsc::Receiver<(String, oneshot::Sender<ATResponse>)>,
         cmd_tx: CommandSender,
+        connection_generation: Arc<AtomicU64>,
     ) -> Self {
         // 建立一个解耦的 URC 分发通道
         let (urc_tx, mut urc_rx) = mpsc::channel::<String>(100);
@@ -106,6 +128,7 @@ impl ATClientActor {
             cmd_tx,
             buffer: Vec::new(),
             urc_tx,
+            connection_generation,
         }
     }
 
@@ -144,6 +167,7 @@ impl ATClientActor {
         match connection.connect().await {
             Ok(_) => {
                 self.connection = Some(connection);
+                self.connection_generation.fetch_add(1, Ordering::Relaxed);
                 true
             }
             Err(e) => {

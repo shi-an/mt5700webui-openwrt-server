@@ -1,5 +1,5 @@
 use crate::client::ATClient;
-use crate::config::Config;
+use crate::config::{normalize_sms_storage, sms_storage_command, Config};
 use crate::models::{get_modem_session_tx, ModemSessionState};
 use crate::network;
 use log::{info, warn, error, debug};
@@ -132,6 +132,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
     let mut active_interface: Option<DataInterface> = None;
     let mut session_query_method = SessionQueryMethod::Discover(0);
     let mut last_session_recovery: Option<Instant> = None;
+    let mut initialized_connection_generation = 0u64;
 
     let session_tx = get_modem_session_tx();
     let mut session_rx = session_tx.subscribe();
@@ -176,6 +177,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     unexpected_response_count = 0;
                     session_query_method = SessionQueryMethod::Discover(0);
                     last_session_recovery = None;
+                    initialized_connection_generation = 0;
                     if previous_mode.is_some() {
                         session_event = None;
                         drain_modem_session_events(&mut session_rx);
@@ -184,9 +186,20 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             }
             Err(e) => {
                 warn!("Unable to determine modem data mode: {}", e);
-                if data_mode.is_none() {
-                    continue;
-                }
+            }
+        }
+
+        let connection_generation = at_client.connection_generation();
+        if connection_generation > 0
+            && initialized_connection_generation != connection_generation
+        {
+            match initialize_modem_services(&config, &at_client).await {
+                Ok(()) => initialized_connection_generation = connection_generation,
+                Err(e) => warn!(
+                    "Failed to initialize modem SMS services for AT connection {}: {}",
+                    connection_generation,
+                    e
+                ),
             }
         }
 
@@ -220,6 +233,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         continue;
                     }
                     ModemSessionState::Disconnected => {
+                        initialized_connection_generation = 0;
                         if is_auto_dial_disabled(&at_client).await {
                             debug!("[monitor] Modem session disconnected while auto dial is disabled.");
                             state = ConnectionState::Disconnected;
@@ -239,6 +253,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 active_mode.label()
                             );
                             let recovered = recover_modem_session(&at_client, active_mode, false).await;
+                            initialized_connection_generation = 0;
                             session_query_method = SessionQueryMethod::Discover(0);
                             last_session_recovery = Some(Instant::now());
                             drain_modem_session_events(&mut session_rx);
@@ -289,6 +304,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 );
                 if session_fail_count >= 3 {
                     let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    initialized_connection_generation = 0;
                     session_query_method = SessionQueryMethod::Discover(0);
                     last_session_recovery = Some(Instant::now());
                     drain_modem_session_events(&mut session_rx);
@@ -314,6 +330,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 );
                 if session_fail_count >= 3 {
                     let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    initialized_connection_generation = 0;
                     session_query_method = SessionQueryMethod::Discover(0);
                     last_session_recovery = Some(Instant::now());
                     drain_modem_session_events(&mut session_rx);
@@ -336,6 +353,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         continue;
                     }
                     let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    initialized_connection_generation = 0;
                     session_query_method = SessionQueryMethod::Discover(0);
                     last_session_recovery = Some(Instant::now());
                     drain_modem_session_events(&mut session_rx);
@@ -395,7 +413,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             }
                         }
 
-                        match configure_router_data_path(&config, &at_client, &selection).await {
+                        match configure_router_data_path(&config, &selection).await {
                             Ok(()) => {
                                 info!(
                                     "Router data path is active on {} (device {}, mode {}).",
@@ -446,6 +464,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                             continue;
                                         }
                                         let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                                        initialized_connection_generation = 0;
                                         session_query_method = SessionQueryMethod::Discover(0);
                                         last_session_recovery = Some(Instant::now());
                                         drain_modem_session_events(&mut session_rx);
@@ -506,20 +525,62 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
     }
 }
 
+async fn initialize_modem_services(config: &Config, at_client: &ATClient) -> Result<()> {
+    debug!("Initializing modem URC reporting and SMS storage...");
+    send_optional_modem_init_command(at_client, "AT+CMGF=0").await;
+
+    let sms_storage = current_sms_storage(config).await;
+    let cpms_command = sms_storage_command(&sms_storage);
+    let response = at_client.send_command(cpms_command.clone()).await?;
+    if !response.success {
+        bail!(
+            "{} failed: {}",
+            cpms_command,
+            response.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+
+    info!(
+        "SMS read, write and receive storage initialized to {}.",
+        sms_storage
+    );
+
+    for command in ["AT+CNMI=2,1,0,2,0", "AT+CLIP=1"] {
+        send_optional_modem_init_command(at_client, command).await;
+    }
+    Ok(())
+}
+
+async fn send_optional_modem_init_command(at_client: &ATClient, command: &str) {
+    match at_client.send_command(command.to_string()).await {
+        Ok(response) if response.success => {}
+        Ok(response) => warn!(
+            "Modem initialization command {} failed: {}",
+            command,
+            response.error.unwrap_or_else(|| "unknown error".to_string())
+        ),
+        Err(e) => warn!("Unable to send modem initialization command {}: {}", command, e),
+    }
+}
+
+async fn current_sms_storage(config: &Config) -> String {
+    let fallback = normalize_sms_storage(&config.advanced_network_config.sms_storage);
+    match Command::new("uci")
+        .args(["-q", "get", "at-webserver.config.sms_storage"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            normalize_sms_storage(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => fallback,
+    }
+}
+
 async fn configure_router_data_path(
     config: &Config,
-    at_client: &ATClient,
     selection: &DataInterface,
 ) -> Result<()> {
-    debug!("Initializing modem URC reporting configs...");
-    let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
-    let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
-    let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
-
-    let sms_mem = &config.advanced_network_config.sms_storage;
-    let cpms_cmd = format!("AT+CPMS=\"{}\",\"{}\",\"{}\"", sms_mem, sms_mem, sms_mem);
-    let _ = at_client.send_command(cpms_cmd).await;
-
     if selection.managed {
         network::setup_ipv4_only(config, &selection.device).await?;
     } else {

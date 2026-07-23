@@ -45,6 +45,7 @@ config at-webserver 'config'
     option pdp_type 'ipv4v6'             # ipv4, ipv6, ipv4v6
     option ifname 'auto'                 # auto、逻辑接口 (wan2) 或物理口 (eth2)
     option ra_master '0'
+    option sms_storage 'SM'              # SM=SIM 卡，ME=模组存储
     
     # 定时锁频配置
     option schedule_enabled '1'
@@ -61,6 +62,8 @@ config at-webserver 'config'
     option tg_chat_id '123456'
     option bark_url 'https://api.day.app/KEY/'
 ```
+
+`sms_storage` 默认为 `SM`（SIM 卡），也可设为 `ME`（模组存储）。后端会在每次 AT 控制通道连接，以及模组数据会话主动重建后，通过 `AT+CPMS` 同时设置读取、写入和接收存储；该初始化不依赖拨号 IP 或路由侧链路。
 
 后端会先查询 `AT^SETAUTODIAL?` 的拨号模式，再选择数据网卡：
 

@@ -1,4 +1,5 @@
 use crate::client::ATClient;
+use crate::config::{normalize_sms_storage, sms_storage_command};
 use futures::{SinkExt, StreamExt};
 use log::{error, info, debug, warn};
 use serde::{Deserialize, Serialize};
@@ -278,16 +279,13 @@ async fn handle_client(
                          if let Some(kv) = cmd_str.trim().strip_prefix("SET_CONFIG:") {
                              if let Some((key, value)) = kv.split_once('=') {
                                  let key = key.trim().to_string();
-                                 let value = value.trim().to_uppercase();
+                                 let value = value.trim().to_string();
                                  // 白名单：只允许保存已知的配置 key，防止注入
                                  let allowed_keys = [
                                      "sms_storage",
                                  ];
                                  let normalized_value = if key == "sms_storage" {
-                                     match value.as_str() {
-                                         "ME" => "ME".to_string(),
-                                         _ => "SM".to_string(),
-                                     }
+                                     normalize_sms_storage(&value)
                                  } else {
                                      value.clone()
                                  };
@@ -315,10 +313,7 @@ async fn handle_client(
 
                                  let mut apply_error: Option<String> = None;
                                  if success && key == "sms_storage" {
-                                     let cpms_cmd = format!(
-                                         "AT+CPMS=\"{}\",\"{}\",\"{}\"",
-                                         normalized_value, normalized_value, normalized_value
-                                     );
+                                     let cpms_cmd = sms_storage_command(&normalized_value);
                                      let (apply_tx, apply_rx) = oneshot::channel();
                                      if sender.send((cpms_cmd.clone(), apply_tx)).await.is_err() {
                                          apply_error = Some("Failed to send AT+CPMS command".to_string());

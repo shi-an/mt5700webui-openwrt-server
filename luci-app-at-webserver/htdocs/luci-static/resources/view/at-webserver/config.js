@@ -343,6 +343,12 @@ return view.extend({
 		o.default = '0';
 		o.depends('notify_log_enable', '1');
 
+		o = s.taboption('notify', form.ListValue, 'sms_storage', _('短信存储位置'), _('选择短信读取、写入和接收使用的存储区域。AT 控制通道每次重新连接时会自动应用。'));
+		o.value('SM', _('SIM 卡'));
+		o.value('ME', _('模组存储'));
+		o.default = 'SM';
+		o.rmempty = false;
+
 		o = s.taboption('notify', form.Flag, 'notify_sms', _('短信通知'), _('接收到新短信时发送通知'));
 		o.default = '1';
 

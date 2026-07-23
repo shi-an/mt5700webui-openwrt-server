@@ -43,6 +43,7 @@ config at-webserver 'config'
 	option notify_log_enable '1'
 	option notify_log_persist '0'
 	option notify_sms '1'
+	option sms_storage 'SM'                  # 短信读/写/接收存储 (SM=SIM卡, ME=模组)
 	option notify_call '1'
 	option notify_memory_full '1'
 	option notify_signal '0'
