@@ -136,6 +136,7 @@ impl ATClientActor {
                 Box::new(SerialATConnection::new(
                     self.config.at_config.serial.port.clone(),
                     self.config.at_config.serial.baudrate,
+                    self.config.at_config.serial.timeout,
                 ))
             }
         };

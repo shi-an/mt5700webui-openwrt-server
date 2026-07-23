@@ -137,14 +137,14 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             at_config: AtConfig {
-                connection_type: ConnectionType::Network,
+                connection_type: ConnectionType::Serial,
                 network: NetworkConfig {
                     host: "192.168.8.1".to_string(),
                     port: 20249,
                     timeout: 10,
                 },
                 serial: SerialConfig {
-                    port: "/dev/ttyUSB0".to_string(),
+                    port: "auto".to_string(),
                     baudrate: 115200,
                     timeout: 10,
                 },
@@ -294,18 +294,18 @@ impl Config {
         };
 
         // AT Config
-        let conn_type_str = get_str("connection_type", "NETWORK");
-        if conn_type_str == "SERIAL" {
-            config.at_config.connection_type = ConnectionType::Serial;
+        let conn_type_str = get_str("connection_type", "SERIAL");
+        config.at_config.connection_type = if conn_type_str == "NETWORK" {
+            ConnectionType::Network
         } else {
-            config.at_config.connection_type = ConnectionType::Network;
-        }
+            ConnectionType::Serial
+        };
 
         config.at_config.network.host = get_str("network_host", "192.168.8.1");
         config.at_config.network.port = get_u16("network_port", 20249);
         config.at_config.network.timeout = get_int("network_timeout", 10);
 
-        let mut serial_port = get_str("serial_port", "/dev/ttyUSB0");
+        let mut serial_port = get_str("serial_port", "auto");
         if serial_port == "custom" {
             serial_port = get_str("serial_port_custom", "/dev/ttyUSB0");
         }

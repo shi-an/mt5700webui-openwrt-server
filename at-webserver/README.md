@@ -36,13 +36,14 @@ config at-webserver 'config'
     option enabled '1'
     
     # 连接配置
-    option connection_type 'NETWORK'
+    option connection_type 'SERIAL'
+    option serial_port 'auto'               # 自动枚举并验证 AT 控制通道
     option network_host '192.168.8.1'
     option network_port '20249'
     
     # 高级网络配置
     option pdp_type 'ipv4v6'             # ipv4, ipv6, ipv4v6
-    option ifname 'auto'                 # auto 或具体接口名 (如 eth2)
+    option ifname 'auto'                 # auto、逻辑接口 (wan2) 或物理口 (eth2)
     option ra_master '0'
     
     # 定时锁频配置
@@ -64,7 +65,9 @@ config at-webserver 'config'
 后端会先查询 `AT^SETAUTODIAL?` 的拨号模式，再选择数据网卡：
 
 - 模式 `1`：USB 虚拟网卡，按模组 USB Vendor ID 探测 ECM/NCM 接口。
-- 模式 `2`：转网口模式，使用软路由原生 2.5G 物理网口；自动检测结果不唯一时必须配置 `ifname`。
+- 模式 `2`：转网口模式，默认复用 OpenWrt 原生逻辑接口 `wan`，不会在同一物理口上启动第二个 DHCP 客户端。
+
+默认控制连接为 `SERIAL + auto`。后端优先枚举 VID `3466` 下的 `ttyUSB*`/`ttyACM*`，逐个发送 `AT`，仅使用返回完整 `OK` 的控制通道。宽带与模组组成多 WAN 时，应将 `ifname` 设置为模组对应的逻辑接口（如 `wan2`）；填写未配置的物理口（如 `eth2`）时，后端会创建并管理 `wan_modem`。
 
 `AT+CGPADDR` 只表示模组侧 PDP 已取得地址。后端还会等待 OpenWrt 接口取得 IPv4 地址和默认路由，成功后才将数据链路标记为可用。
 

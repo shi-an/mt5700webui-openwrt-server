@@ -36,6 +36,31 @@ enum ConnectionState {
     DataPathConfigured,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataInterface {
+    device: String,
+    logical_interface: String,
+    managed: bool,
+}
+
+impl DataInterface {
+    fn managed(device: String) -> Self {
+        Self {
+            device,
+            logical_interface: "wan_modem".to_string(),
+            managed: true,
+        }
+    }
+
+    fn existing(logical_interface: &str, device: String) -> Self {
+        Self {
+            device,
+            logical_interface: logical_interface.to_string(),
+            managed: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataMode {
     Usb,
@@ -58,6 +83,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
     let mut ping_fail_count = 0u32;
     let mut unexpected_response_count = 0u32;
     let mut data_mode: Option<DataMode> = None;
+    let mut active_interface: Option<DataInterface> = None;
 
     // 订阅 ^NDISSTAT 断开事件，断线时无需等待轮询立即响应
     let ndis_tx = get_ndis_disconnect_tx();
@@ -105,6 +131,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     }
                     data_mode = Some(detected);
                     state = ConnectionState::Disconnected;
+                    active_interface = None;
                 }
             }
             Err(e) => {
@@ -127,6 +154,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 state = ConnectionState::Disconnected;
                 ping_fail_count = 0;
                 unexpected_response_count = 0;
+                active_interface = None;
                 continue;
             }
             if !matches!(state, ConnectionState::Disconnected) {
@@ -135,6 +163,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             trigger_disaster_recovery(&config, &at_client, active_mode).await;
             ping_fail_count = 0;
             unexpected_response_count = 0;
+            active_interface = None;
             continue;
         }
 
@@ -151,6 +180,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             unexpected_response_count = 0;
                             ping_fail_count = 0;
                             state = ConnectionState::Disconnected;
+                            active_interface = None;
                         }
                     }
 
@@ -160,6 +190,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         if is_auto_dial_disabled(&at_client).await {
                             debug!("[monitor] No IP but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
                             state = ConnectionState::Disconnected;
+                            active_interface = None;
                             continue;
                         }
                         if !matches!(state, ConnectionState::Disconnected) {
@@ -170,6 +201,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         trigger_disaster_recovery(&config, &at_client, active_mode).await;
                         ping_fail_count = 0;
                         state = ConnectionState::Disconnected;
+                        active_interface = None;
                     }
 
                     ref status if status.has_ip() => {
@@ -191,26 +223,36 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 debug!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
                                 let _ = at_client.send_command(cpms_cmd).await;
 
-                                let actual_ifname = match detect_data_ifname(
+                                let selected_interface = match detect_data_interface(
                                     &config.advanced_network_config.ifname,
                                     active_mode,
                                 ).await {
-                                    Ok(ifname) => ifname,
+                                    Ok(selection) => selection,
                                     Err(e) => {
                                         error!("Failed to select data interface: {}", e);
                                         state = ConnectionState::Disconnected;
+                                        active_interface = None;
                                         continue;
                                     }
                                 };
                                 info!(
-                                    "Using data interface {} for {} mode.",
-                                    actual_ifname,
-                                    active_mode.label()
+                                    "Using data device {} through OpenWrt interface {} for {} mode.",
+                                    selected_interface.device,
+                                    selected_interface.logical_interface,
+                                    active_mode.label(),
                                 );
 
-                                if let Err(e) = network::setup_ipv4_only(&config, &actual_ifname).await {
+                                let setup_result = if selected_interface.managed {
+                                    network::setup_ipv4_only(&config, &selected_interface.device).await
+                                } else {
+                                    network::ensure_existing_ipv4_interface(
+                                        &selected_interface.logical_interface,
+                                    ).await
+                                };
+                                if let Err(e) = setup_result {
                                     error!("Failed to setup IPv4 network: {}", e);
                                     state = ConnectionState::Disconnected;
+                                    active_interface = None;
                                     continue;
                                 }
                                 debug!("IPv4 setup done.");
@@ -221,32 +263,51 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 // IMS/IPv6 地址不一定出现在响应中），只要配置了就尝试注入
                                 let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
 
-                                if ipv6_needed {
+                                if ipv6_needed && selected_interface.managed {
                                     info!("IPv6 configured (pdp_type={}). Injecting IPv6 interface...", pdp_type);
-                                    if let Err(e) = network::inject_ipv6_interface(&config, &actual_ifname).await {
+                                    if let Err(e) = network::inject_ipv6_interface(&config, &selected_interface.device).await {
                                         error!("Failed to inject IPv6 interface: {}", e);
                                     } else {
                                         debug!("IPv6 Injection Completed.");
                                     }
+                                } else if ipv6_needed {
+                                    debug!(
+                                        "Reusing existing OpenWrt interface {}; preserving its IPv6 configuration.",
+                                        selected_interface.logical_interface
+                                    );
                                 }
 
+                                active_interface = Some(selected_interface.clone());
                                 state = ConnectionState::DataPathConfigured;
                                 ping_fail_count = 0;
                                 info!(
-                                    "Network setup complete. Router data path is active on {}.",
-                                    actual_ifname
+                                    "Network setup complete. Router data path is active on {} (device {}).",
+                                    selected_interface.logical_interface,
+                                    selected_interface.device,
                                 );
                             }
 
                             ConnectionState::DataPathConfigured => {
-                                if !check_router_network_status(&config).await {
+                                let Some(logical_interface) = active_interface
+                                    .as_ref()
+                                    .map(|selection| selection.logical_interface.clone())
+                                else {
+                                    state = ConnectionState::Disconnected;
+                                    continue;
+                                };
+                                if !check_router_network_status(&logical_interface).await {
                                     ping_fail_count += 1;
-                                    warn!("Router-side network check failed. Count: {}/3", ping_fail_count);
+                                    warn!(
+                                        "Router-side network check failed on {}. Count: {}/3",
+                                        logical_interface,
+                                        ping_fail_count
+                                    );
                                     if ping_fail_count >= 3 {
                                         warn!("Continuous 3 router-side failures detected! Triggering disaster recovery.");
                                         trigger_disaster_recovery(&config, &at_client, active_mode).await;
                                         ping_fail_count = 0;
                                         state = ConnectionState::Disconnected;
+                                        active_interface = None;
                                         continue;
                                     }
                                 } else if ping_fail_count > 0 {
@@ -277,17 +338,17 @@ fn log_ip_status(status: &IpStatus) {
     }
 }
 
-async fn check_router_network_status(_config: &Config) -> bool {
-    // 1) 检查 wan_modem 接口状态（路由侧）
+async fn check_router_network_status(interface: &str) -> bool {
+    // 1) 检查实际使用的 OpenWrt 逻辑接口状态（路由侧）
     let status_out = Command::new("ifstatus")
-        .arg("wan_modem")
+        .arg(interface)
         .output()
         .await;
 
     let output = match status_out {
         Ok(o) if o.status.success() => o,
         _ => {
-            warn!("ifstatus wan_modem failed.");
+            warn!("ifstatus {} failed.", interface);
             return false;
         }
     };
@@ -296,14 +357,14 @@ async fn check_router_network_status(_config: &Config) -> bool {
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(j) => j,
         Err(e) => {
-            warn!("Failed to parse ifstatus wan_modem JSON: {}", e);
+            warn!("Failed to parse ifstatus {} JSON: {}", interface, e);
             return false;
         }
     };
 
     let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
     if !up {
-        warn!("wan_modem is down.");
+        warn!("{} is down.", interface);
         return false;
     }
 
@@ -326,7 +387,10 @@ async fn check_router_network_status(_config: &Config) -> bool {
         .unwrap_or(false);
 
     if has_ipv4 && has_default_route {
-        debug!("Router-side network status OK (wan_modem up + IPv4 + default route).");
+        debug!(
+            "Router-side network status OK ({} up + IPv4 + default route).",
+            interface
+        );
         true
     } else {
         warn!(
@@ -496,20 +560,24 @@ async fn try_dial_and_bind(
     // 手册：NDISDUP 是异步AT，sleep 5s 等待 ^NDISSTAT: 1 及 DHCP 就绪
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
     sleep(Duration::from_secs(5)).await;
-    let actual_ifname = match detect_data_ifname(
+    let selected_interface = match detect_data_interface(
         &config.advanced_network_config.ifname,
         data_mode,
     ).await {
-        Ok(ifname) => ifname,
+        Ok(selection) => selection,
         Err(e) => {
             error!("[dial] Failed to select data interface: {}", e);
             return false;
         }
     };
-    let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await;
+    let _ = Command::new("ip").args(&["link", "set", "dev", &selected_interface.device, "down"]).status().await;
     sleep(Duration::from_secs(1)).await;
-    let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await;
-    info!("[dial] Interface {} restarted. Recovery complete.", actual_ifname);
+    let _ = Command::new("ip").args(&["link", "set", "dev", &selected_interface.device, "up"]).status().await;
+    info!(
+        "[dial] Device {} restarted for OpenWrt interface {}. Recovery complete.",
+        selected_interface.device,
+        selected_interface.logical_interface
+    );
     true
 }
 
@@ -545,21 +613,82 @@ async fn wait_for_ip(at_client: &ATClient) -> bool {
     }
 }
 
-async fn detect_data_ifname(configured: &str, data_mode: DataMode) -> Result<String> {
+async fn detect_data_interface(configured: &str, data_mode: DataMode) -> Result<DataInterface> {
     if !configured.is_empty() && configured != "auto" {
+        if let Some(selection) = resolve_logical_interface(configured).await {
+            return Ok(selection);
+        }
+
         let path = format!("/sys/class/net/{}", configured);
         if fs::metadata(&path).await.is_err() {
             bail!("configured interface {} does not exist", configured);
         }
-        return Ok(configured.to_string());
+        return Ok(DataInterface::managed(configured.to_string()));
     }
 
     match data_mode {
-        DataMode::Usb => detect_usb_modem_interface().await.ok_or_else(|| {
-            anyhow!("no USB virtual network interface with vendor ID 3466 was found")
-        }),
-        DataMode::Ethernet => detect_native_ethernet_interface().await,
+        DataMode::Usb => detect_usb_modem_interface()
+            .await
+            .map(DataInterface::managed)
+            .ok_or_else(|| {
+                anyhow!("no USB virtual network interface with vendor ID 3466 was found")
+            }),
+        DataMode::Ethernet => {
+            if let Some(selection) = resolve_logical_interface("wan").await {
+                info!(
+                    "Using native OpenWrt WAN interface {} (device {}).",
+                    selection.logical_interface,
+                    selection.device
+                );
+                return Ok(selection);
+            }
+
+            detect_native_gigabit_interface()
+                .await
+                .map(DataInterface::managed)
+        }
     }
+}
+
+/// Resolve an existing OpenWrt logical interface to its kernel network device.
+/// Reusing `wan` avoids starting a second DHCP client on the same physical port.
+async fn resolve_logical_interface(interface: &str) -> Option<DataInterface> {
+    let uci_key = format!("network.{}.device", interface);
+    let configured_device = Command::new("uci")
+        .args(["-q", "get", &uci_key])
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+
+    if let Some(device) = configured_device {
+        if fs::metadata(format!("/sys/class/net/{}", device)).await.is_ok() {
+            return Some(DataInterface::existing(interface, device));
+        }
+    }
+
+    let output = Command::new("ifstatus").arg(interface).output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let selection = interface_status_devices(&status).find_map(|device| {
+        std::path::Path::new("/sys/class/net")
+            .join(&device)
+            .exists()
+            .then(|| DataInterface::existing(interface, device))
+    });
+    selection
+}
+
+fn interface_status_devices(status: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+    ["device", "l3_device"]
+        .into_iter()
+        .filter_map(|field| status.get(field)?.as_str().map(str::to_string))
 }
 
 /// USB data mode: find the virtual ECM/NCM interface below the modem USB device.
@@ -600,10 +729,9 @@ async fn detect_usb_modem_interface() -> Option<String> {
     None
 }
 
-/// Ethernet port mode has no sysfs relationship with the modem USB
-/// device. Select only a native, unbridged 2.5G physical port with carrier.
-/// Ambiguous results are rejected so an arbitrary LAN/WAN port is never rebound.
-async fn detect_native_ethernet_interface() -> Result<String> {
+/// Fallback for systems without a resolvable `network.wan`: select a unique,
+/// linked native gigabit port. Multi-WAN systems must configure the interface.
+async fn detect_native_gigabit_interface() -> Result<String> {
     let net_dir = "/sys/class/net";
     let mut entries = fs::read_dir(net_dir).await?;
     let mut candidates = Vec::new();
@@ -640,12 +768,12 @@ async fn detect_native_ethernet_interface() -> Result<String> {
             .await
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok());
-        if speed != Some(2500) {
+        if speed != Some(1000) {
             continue;
         }
 
         debug!(
-            "Native Ethernet candidate: {} (speed=2500, path={})",
+            "Native gigabit Ethernet candidate: {} (speed=1000, path={})",
             iface,
             device_path
         );
@@ -674,10 +802,10 @@ fn select_single_ethernet_candidate(mut candidates: Vec<String>) -> Result<Strin
     match candidates.len() {
         1 => Ok(candidates.remove(0)),
         0 => bail!(
-            "no active native 2.5G Ethernet port was found; configure option ifname explicitly"
+            "native OpenWrt interface wan could not be resolved and no active native gigabit port was found; configure option ifname explicitly"
         ),
         _ => bail!(
-            "multiple active native 2.5G Ethernet ports were found ({}); configure option ifname explicitly",
+            "multiple active native gigabit Ethernet ports were found ({}); configure the modem WAN interface explicitly",
             candidates.join(", ")
         ),
     }
@@ -776,5 +904,17 @@ mod tests {
             "eth3".to_string(),
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prefers_physical_device_over_protocol_l3_device() {
+        let status = serde_json::json!({
+            "device": "eth1",
+            "l3_device": "pppoe-wan"
+        });
+        assert_eq!(
+            interface_status_devices(&status).collect::<Vec<_>>(),
+            vec!["eth1".to_string(), "pppoe-wan".to_string()]
+        );
     }
 }

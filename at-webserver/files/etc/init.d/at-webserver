@@ -38,13 +38,39 @@ start_service() {
 	
 	# 自动检测并添加 USB 串口设备 ID（如果需要）
 	detect_and_add_usb_serial() {
-		# 仅在发现 MT5700 且尚无 ttyUSB* 时处理
-		if ! lsusb -d 3466:3301 >/dev/null 2>&1; then
-			return 0
-		fi
-		if ls /dev/ttyUSB* >/dev/null 2>&1; then
-			return 0
-		fi
+		# 仅在发现 MT5700 且该设备尚无串口节点时处理。不能因为系统里
+		# 存在其他 ttyUSB 设备就跳过，否则控制通道自动枚举看不到模组。
+		has_mt5700_usb() {
+			local vendor_path device_path vendor product
+			for vendor_path in /sys/bus/usb/devices/*/idVendor; do
+				[ -r "$vendor_path" ] || continue
+				device_path="${vendor_path%/idVendor}"
+				vendor="$(tr 'A-F' 'a-f' < "$vendor_path" 2>/dev/null)"
+				product="$(tr 'A-F' 'a-f' < "$device_path/idProduct" 2>/dev/null)"
+				[ "$vendor" = "3466" ] && [ "$product" = "3301" ] && return 0
+			done
+			return 1
+		}
+
+		has_mt5700_serial() {
+			local tty_path device_path vendor
+			for tty_path in /sys/class/tty/ttyUSB* /sys/class/tty/ttyACM*; do
+				[ -e "$tty_path/device" ] || continue
+				device_path="$(readlink -f "$tty_path/device" 2>/dev/null)"
+				while [ -n "$device_path" ] && [ "$device_path" != "/" ]; do
+					if [ -r "$device_path/idVendor" ]; then
+						vendor="$(tr 'A-F' 'a-f' < "$device_path/idVendor" 2>/dev/null)"
+						[ "$vendor" = "3466" ] && return 0
+						break
+					fi
+					device_path="${device_path%/*}"
+				done
+			done
+			return 1
+		}
+
+		has_mt5700_usb || return 0
+		has_mt5700_serial && return 0
 
 		# 加载必要模块（忽略已加载）
 		modprobe usbserial 2>/dev/null || true
@@ -53,6 +79,8 @@ start_service() {
 		modprobe cdc_ether 2>/dev/null || true
 		modprobe cdc_ncm 2>/dev/null || true
 		modprobe huawei_cdc_ncm 2>/dev/null || true
+		sleep 1
+		has_mt5700_serial && return 0
 
 		# 兼容不同内核的 new_id 路径
 		local NEW_ID=""
@@ -63,12 +91,9 @@ start_service() {
 			return 0
 		fi
 
-		# 仅绑定一次
-		if ! grep -q "3466[[:space:]]\+3301" "$NEW_ID" 2>/dev/null; then
-			echo "3466 3301" > "$NEW_ID" 2>/dev/null && \
-				logger -t at-webserver "已添加 USB 设备 ID: 3466:3301 to $(basename $(dirname $NEW_ID))" || \
-				logger -t at-webserver "添加 USB 设备 ID 失败: 3466:3301"
-		fi
+		echo "3466 3301" > "$NEW_ID" 2>/dev/null && \
+			logger -t at-webserver "已添加 USB 设备 ID: 3466:3301 to $(basename $(dirname $NEW_ID))" || \
+			logger -t at-webserver "添加 USB 设备 ID 失败: 3466:3301"
 
 		# 等待设备节点出现
 		sleep 1

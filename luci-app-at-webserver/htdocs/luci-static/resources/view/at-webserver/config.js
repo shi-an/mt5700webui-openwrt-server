@@ -74,9 +74,9 @@ return view.extend({
 		// 连接类型
 		o = s.taboption('general', form.ListValue, 'connection_type', _('连接类型'),
 			_('选择AT命令的连接方式'));
-		o.value('NETWORK', _('网络连接'));
 		o.value('SERIAL', _('串口连接'));
-		o.default = 'NETWORK';
+		o.value('NETWORK', _('网络连接'));
+		o.default = 'SERIAL';
 		o.rmempty = false;
 
 		// 网络连接配置
@@ -113,8 +113,8 @@ return view.extend({
 		o.depends('connection_type', 'NETWORK');
 
 		// 串口连接配置
-		o = s.taboption('general', form.ListValue, 'serial_port', _('串口设备'),
-			_('选择串口设备或手动输入路径'));
+		o = s.taboption('general', form.ListValue, 'serial_port', _('控制通道'),
+			_('自动模式会枚举 USB 串口并发送 AT 验证，选择实际返回 OK 的控制通道。'));
 		o.depends('connection_type', 'SERIAL');
 		
 		// 动态添加系统中可用的串口设备
@@ -128,11 +128,12 @@ return view.extend({
 				
 				this.keylist = [];
 				this.vallist = [];
+				this.value('auto', _('自动枚举 AT 控制通道'));
 				
 				var serialDevices = [];
 				devices.forEach(function(item) {
 					var name = item.name;
-					if (name.match(/^tty(USB|ACM|S)\d+$/)) {
+					if (name.match(/^tty(USB|ACM)\d+$/)) {
 						serialDevices.push('/dev/' + name);
 					}
 				});
@@ -149,18 +150,18 @@ return view.extend({
 				
 				this.value('custom', _('自定义路径...'));
 				
-				if (currentValue && !serialDevices.includes(currentValue) && currentValue !== 'custom') {
+				if (currentValue && currentValue !== 'auto' && !serialDevices.includes(currentValue) && currentValue !== 'custom') {
 					this.value(currentValue, currentValue + ' (当前)');
 				}
 				
 				return currentValue;
 			}, this));
 		};
-		o.default = '/dev/ttyUSB0';
+		o.default = 'auto';
 		
 		o = s.taboption('general', form.Value, 'serial_port_custom', _('自定义串口路径'),
 			_('输入完整的串口设备路径'));
-		o.depends('serial_port', 'custom');
+		o.depends({ connection_type: 'SERIAL', serial_port: 'custom' });
 		o.placeholder = '/dev/ttyUSB0';
 		o.rmempty = false;
 
@@ -181,9 +182,9 @@ return view.extend({
 		// --- 高级网络 ---
 
 		o = s.taboption('network', form.Value, 'ifname', _('数据网卡'),
-			_('留空或填写 auto 时自动检测：USB 模式匹配模组 USB 网卡，转网口模式匹配唯一一个已连接的原生 2.5G 网口。存在多个候选网口时必须明确填写，例如 eth2。'));
+			_('auto：USB 模式匹配模组 USB 网卡；转网口模式直接复用 OpenWrt 原生 wan。宽带与模组并用时请填写模组逻辑接口（如 wan2）或专用物理口（如 eth2）。'));
 		o.default = 'auto';
-		o.placeholder = 'eth2';
+		o.placeholder = 'wan2';
 		o.rmempty = false;
 
 		o = s.taboption('network', form.DynamicList, 'dns_list', _('自定义 DNS'), _('留空则自动使用运营商下发的 DNS。填写后将强制使用此处指定的 DNS 服务器。'));

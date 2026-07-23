@@ -9,9 +9,19 @@ use tokio::time::{sleep, Duration, Instant};
 pub async fn clean_startup_state() -> Result<()> {
     debug!("Performing startup cleanup...");
     let cleanup_script = r#"
-        uci -q delete network.wan_modem
-        uci -q delete network.wan_modem6
-        uci commit network
+        NETWORK_CHANGED=0
+        if uci -q get network.wan_modem >/dev/null; then
+            uci -q delete network.wan_modem
+            NETWORK_CHANGED=1
+        fi
+        if uci -q get network.wan_modem6 >/dev/null; then
+            uci -q delete network.wan_modem6
+            NETWORK_CHANGED=1
+        fi
+        if [ "$NETWORK_CHANGED" -eq 1 ]; then
+            uci commit network
+            /etc/init.d/network reload
+        fi
         
         # 尝试清理可能存在的防火墙残留
         WAN_ZONE=$(uci show firewall | grep "\.name='wan'" | cut -d'.' -f2 | head -n 1)
@@ -21,8 +31,6 @@ pub async fn clean_startup_state() -> Result<()> {
             uci commit firewall
         fi
         
-        # 重载配置
-        /etc/init.d/network reload
         fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
         exit 0
     "#;
@@ -99,6 +107,20 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     
     debug!("IPv4 network setup completed.");
     Ok(())
+}
+
+/// Reuse an existing OpenWrt interface such as `wan`. Its UCI ownership and
+/// protocol remain untouched; the backend only brings it up when necessary and
+/// waits for the same address/route readiness required from managed interfaces.
+pub async fn ensure_existing_ipv4_interface(interface: &str) -> Result<()> {
+    if current_ipv4_interface_ready(interface).await {
+        info!("Existing interface {} is already ready.", interface);
+        return Ok(());
+    }
+
+    debug!("Bringing up existing OpenWrt interface {}...", interface);
+    run_command("ifup", &[interface]).await?;
+    wait_for_ipv4_interface(interface, Duration::from_secs(60)).await
 }
 
 /// 为 MT5700M-CN 配置 IPv6。
@@ -256,18 +278,12 @@ async fn wait_for_ipv4_interface(interface: &str, timeout: Duration) -> Result<(
     let started = Instant::now();
 
     while started.elapsed() < timeout {
-        if let Ok(output) = Command::new("ifstatus").arg(interface).output().await {
-            if output.status.success() {
-                if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    if ipv4_interface_ready(&status) {
-                        info!(
-                            "Interface {} is ready (IPv4 address and default route acquired).",
-                            interface
-                        );
-                        return Ok(());
-                    }
-                }
-            }
+        if current_ipv4_interface_ready(interface).await {
+            info!(
+                "Interface {} is ready (IPv4 address and default route acquired).",
+                interface
+            );
+            return Ok(());
         }
 
         sleep(Duration::from_secs(2)).await;
@@ -278,6 +294,18 @@ async fn wait_for_ipv4_interface(interface: &str, timeout: Duration) -> Result<(
         interface,
         timeout.as_secs()
     ))
+}
+
+async fn current_ipv4_interface_ready(interface: &str) -> bool {
+    let Ok(output) = Command::new("ifstatus").arg(interface).output().await else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .map(|status| ipv4_interface_ready(&status))
+        .unwrap_or(false)
 }
 
 fn ipv4_interface_ready(status: &serde_json::Value) -> bool {
