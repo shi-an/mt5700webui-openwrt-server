@@ -123,6 +123,14 @@ pub async fn ensure_existing_ipv4_interface(interface: &str) -> Result<()> {
     wait_for_ipv4_interface(interface, Duration::from_secs(60)).await
 }
 
+pub async fn restart_ipv4_interface(interface: &str) -> Result<()> {
+    debug!("Restarting OpenWrt interface {}...", interface);
+    let _ = run_command("ifdown", &[interface]).await;
+    sleep(Duration::from_secs(1)).await;
+    run_command("ifup", &[interface]).await?;
+    wait_for_ipv4_interface(interface, Duration::from_secs(60)).await
+}
+
 /// 为 MT5700M-CN 配置 IPv6。
 ///
 /// 设计原则：尊重用户配置，只在接口不存在时写入默认值。

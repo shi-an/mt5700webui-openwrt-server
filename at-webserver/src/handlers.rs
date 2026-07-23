@@ -375,10 +375,10 @@ impl NewSMSHandler {
     }
 }
 
-/// 处理 ^NDISSTAT URC，实时感知 NDIS 拨号连接状态变化
+/// 处理 ^NDISSTAT URC，实时感知模组数据会话状态变化
 /// 参考 MT5700M-CN AT命令手册 16.2 ^NDISSTAT
 /// 格式: ^NDISSTAT: [<cid>,]<stat>,[<err>],[<wx_state>],<PDP_type>
-/// stat: 0=断开, 1=已连接
+/// stat: 0/3=断开, 1=已连接, 2=连接中
 pub struct NdisStatHandler;
 
 #[async_trait]
@@ -392,47 +392,94 @@ impl MessageHandler for NdisStatHandler {
         _notifications: &NotificationManager,
         _cmd_tx: &CommandSender,
     ) -> Result<()> {
-        // ^NDISSTAT: 1,,,"IPV4"  or  ^NDISSTAT: 0,0,,"IPV4"
-        let data = line.trim_start_matches("^NDISSTAT:").trim();
-        let parts: Vec<&str> = data.splitn(4, ',').collect();
+        let Some(event) = parse_ndis_stat(line) else {
+            warn!("^NDISSTAT: unrecognized format: {}", line);
+            return Ok(());
+        };
 
-        // stat 可能在第1位（无cid前缀）或第2位（有cid前缀），通过是否能parse为数字判断
-        let stat = parts.first().and_then(|s| s.trim().parse::<u8>().ok());
-        let pdp_type = parts.last().map(|s| s.trim().trim_matches('"')).unwrap_or("");
-
-        let (connected, stat_str) = match stat {
-            Some(1) => (true, "connected"),
-            Some(0) => (false, "disconnected"),
-            _ => {
-                warn!("^NDISSTAT: unrecognized format: {}", line);
-                return Ok(());
+        let status = match event.state {
+            crate::models::ModemSessionState::Connected => {
+                info!(
+                    "^NDISSTAT: modem data session established (cid={:?}, type={})",
+                    event.cid,
+                    event.pdp_type.as_deref().unwrap_or("unknown")
+                );
+                "connected"
+            }
+            crate::models::ModemSessionState::Connecting => {
+                info!("^NDISSTAT: modem data session is connecting (cid={:?})", event.cid);
+                "connecting"
+            }
+            crate::models::ModemSessionState::Disconnected => {
+                warn!(
+                    "^NDISSTAT: modem data session lost (cid={:?}, err={:?}, type={})",
+                    event.cid,
+                    event.error_code,
+                    event.pdp_type.as_deref().unwrap_or("unknown")
+                );
+                "disconnected"
             }
         };
 
-        if connected {
-            info!("^NDISSTAT: NDIS connection established ({})", pdp_type);
-        } else {
-            let err_code = parts.get(1).map(|s| s.trim()).unwrap_or("0");
-            warn!("^NDISSTAT: NDIS connection lost (err={}, type={})", err_code, pdp_type);
-            // 立即通知 dial_monitor 触发恢复，无需等待下一次轮询
-            let tx = crate::models::get_ndis_disconnect_tx();
-            let _ = tx.send(());
-        }
+        let tx = crate::models::get_modem_session_tx();
+        let _ = tx.send(event.clone());
 
         // 广播给前端 WebSocket
         if let Some(tx) = crate::server::WS_BROADCASTER.get() {
             let msg = serde_json::json!({
                 "type": "ndis_stat",
                 "data": {
-                    "connected": connected,
-                    "status": stat_str,
-                    "pdp_type": pdp_type,
+                    "connected": event.state == crate::models::ModemSessionState::Connected,
+                    "status": status,
+                    "cid": event.cid,
+                    "error_code": event.error_code,
+                    "pdp_type": event.pdp_type,
                 }
             }).to_string();
             let _ = tx.send(msg);
         }
         Ok(())
     }
+}
+
+fn parse_ndis_stat(line: &str) -> Option<crate::models::ModemSessionEvent> {
+    let payload = line.strip_prefix("^NDISSTAT:")?.trim();
+    let fields: Vec<&str> = payload.split(',').map(str::trim).collect();
+    if fields.is_empty() {
+        return None;
+    }
+
+    let has_cid = fields.len() >= 5;
+    let cid = if has_cid {
+        Some(fields.first()?.parse::<u8>().ok()?)
+    } else {
+        None
+    };
+    let status_index = usize::from(has_cid);
+    let raw_status = fields.get(status_index)?.parse::<u8>().ok()?;
+    let state = match raw_status {
+        1 => crate::models::ModemSessionState::Connected,
+        2 => crate::models::ModemSessionState::Connecting,
+        0 | 3 => crate::models::ModemSessionState::Disconnected,
+        _ => return None,
+    };
+    let error_index = status_index + 1;
+    let error_code = fields
+        .get(error_index)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok());
+    let pdp_type = fields
+        .get(status_index + 3)
+        .map(|value| value.trim_matches('"'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Some(crate::models::ModemSessionEvent {
+        cid,
+        state,
+        error_code,
+        pdp_type,
+    })
 }
 
 pub struct PDCPDataHandler;
@@ -627,5 +674,37 @@ impl MessageHandler for NetworkSignalHandler {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ModemSessionState;
+
+    #[test]
+    fn parses_standard_ndis_session_events() {
+        let connected = parse_ndis_stat("^NDISSTAT: 1,,,\"IPV4\"").unwrap();
+        assert_eq!(connected.cid, None);
+        assert_eq!(connected.state, ModemSessionState::Connected);
+        assert_eq!(connected.pdp_type.as_deref(), Some("IPV4"));
+
+        let disconnected = parse_ndis_stat("^NDISSTAT: 0,33,,\"IPV4V6\"").unwrap();
+        assert_eq!(disconnected.state, ModemSessionState::Disconnected);
+        assert_eq!(disconnected.error_code, Some(33));
+    }
+
+    #[test]
+    fn parses_cid_prefixed_ndis_session_event() {
+        let event = parse_ndis_stat("^NDISSTAT: 1,0,29,,\"IPV4V6\"").unwrap();
+        assert_eq!(event.cid, Some(1));
+        assert_eq!(event.state, ModemSessionState::Disconnected);
+        assert_eq!(event.error_code, Some(29));
+        assert_eq!(event.pdp_type.as_deref(), Some("IPV4V6"));
+    }
+
+    #[test]
+    fn rejects_malformed_cid_prefixed_ndis_session_event() {
+        assert!(parse_ndis_stat("^NDISSTAT: x,0,29,,\"IPV4V6\"").is_none());
     }
 }

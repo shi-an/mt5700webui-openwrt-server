@@ -2,13 +2,28 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-/// 全局 NDIS 断开事件广播器
-/// ^NDISSTAT: 0 时由 NdisStatHandler 发送，dial_monitor 订阅后立即触发恢复
-pub static NDIS_DISCONNECT_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModemSessionState {
+    Connected,
+    Connecting,
+    Disconnected,
+}
 
-pub fn get_ndis_disconnect_tx() -> &'static broadcast::Sender<()> {
-    NDIS_DISCONNECT_TX.get_or_init(|| {
-        let (tx, _) = broadcast::channel(8);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModemSessionEvent {
+    pub cid: Option<u8>,
+    pub state: ModemSessionState,
+    pub error_code: Option<u32>,
+    pub pdp_type: Option<String>,
+}
+
+/// ^NDISSTAT is the modem-side data-session event. It is independent from the
+/// OpenWrt interface state and is therefore broadcast as structured data.
+pub static MODEM_SESSION_TX: OnceLock<broadcast::Sender<ModemSessionEvent>> = OnceLock::new();
+
+pub fn get_modem_session_tx() -> &'static broadcast::Sender<ModemSessionEvent> {
+    MODEM_SESSION_TX.get_or_init(|| {
+        let (tx, _) = broadcast::channel(16);
         tx
     })
 }

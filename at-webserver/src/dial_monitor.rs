@@ -1,14 +1,17 @@
 use crate::client::ATClient;
 use crate::config::Config;
-use crate::models::get_ndis_disconnect_tx;
+use crate::models::{get_modem_session_tx, ModemSessionState};
 use crate::network;
 use log::{info, warn, error, debug};
-use std::time::Duration;
-use tokio::time::{sleep, interval};
+use std::time::{Duration, Instant};
+use tokio::time::{sleep, interval, MissedTickBehavior};
 use tokio::process::Command;
 use anyhow::{anyhow, bail, Result};
 
 use tokio::fs;
+
+const DATA_CID: u8 = 1;
+const SESSION_QUERY_FAILURE_LIMIT: u8 = 3;
 
 /// IP 连接状态，参考 QModem modem_dial.sh 的 connection_status 四状态设计
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +37,48 @@ impl IpStatus {
 enum ConnectionState {
     Disconnected,
     DataPathConfigured,
+}
+
+#[derive(Debug, PartialEq)]
+enum DataSessionStatus {
+    Connected(IpStatus),
+    Connecting,
+    NoAddress,
+    Disconnected,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionQueryMethod {
+    Discover(u8),
+    QueryAll,
+    QueryCid,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterLinkStatus {
+    Ready,
+    DeviceMissing,
+    CarrierDown,
+    InterfaceUnavailable,
+    InterfaceDown,
+    MissingIpv4,
+    MissingDefaultRoute,
+}
+
+impl RouterLinkStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::DeviceMissing => "device missing",
+            Self::CarrierDown => "physical carrier down",
+            Self::InterfaceUnavailable => "ifstatus unavailable",
+            Self::InterfaceDown => "logical interface down",
+            Self::MissingIpv4 => "IPv4 address missing",
+            Self::MissingDefaultRoute => "default route missing",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,49 +122,43 @@ impl DataMode {
 }
 
 pub async fn start_monitor(config: Config, at_client: ATClient) {
-    info!("Starting dial monitor with Disaster Recovery...");
-    
+    info!("Starting mode-aware modem session and router link monitor...");
+
     let mut state = ConnectionState::Disconnected;
-    let mut ping_fail_count = 0u32;
+    let mut router_fail_count = 0u32;
+    let mut session_fail_count = 0u32;
     let mut unexpected_response_count = 0u32;
     let mut data_mode: Option<DataMode> = None;
     let mut active_interface: Option<DataInterface> = None;
+    let mut session_query_method = SessionQueryMethod::Discover(0);
+    let mut last_session_recovery: Option<Instant> = None;
 
-    // 订阅 ^NDISSTAT 断开事件，断线时无需等待轮询立即响应
-    let ndis_tx = get_ndis_disconnect_tx();
-    let mut ndis_rx = ndis_tx.subscribe();
+    let session_tx = get_modem_session_tx();
+    let mut session_rx = session_tx.subscribe();
 
-    // 10 秒轮询定时器
     let mut poll_timer = interval(Duration::from_secs(10));
+    poll_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        // 同时等待：轮询定时器 或 NDIS 断开事件（哪个先到处理哪个）
-        let ndis_disconnected = tokio::select! {
-            _ = poll_timer.tick() => {
-                false // 正常轮询
-            }
-            result = ndis_rx.recv() => {
+        let mut session_event = tokio::select! {
+            _ = poll_timer.tick() => None,
+            result = session_rx.recv() => {
                 match result {
-                    Ok(()) => {
-                        warn!("[NDISSTAT] Disconnect event received! Triggering immediate recovery.");
-                        true
-                    }
+                    Ok(event) => Some(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("[NDISSTAT] Missed {} disconnect events, treating as disconnected.", n);
-                        true
+                        warn!("[NDISSTAT] Missed {} modem session events; polling current state.", n);
+                        None
                     }
-                    Err(_) => false,
+                    Err(_) => None,
                 }
             }
         };
 
-        // The modem explicitly reports whether data uses a USB virtual NIC or
-        // the external Ethernet port. Refresh before every health check so a
-        // modem reboot or mode switch cannot leave us managing the wrong interface.
         match detect_data_mode(&at_client).await {
             Ok(detected) => {
                 if data_mode != Some(detected) {
-                    if let Some(previous) = data_mode {
+                    let previous_mode = data_mode;
+                    if let Some(previous) = previous_mode {
                         warn!(
                             "Modem data mode changed: {} -> {}.",
                             previous.label(),
@@ -132,6 +171,15 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     data_mode = Some(detected);
                     state = ConnectionState::Disconnected;
                     active_interface = None;
+                    router_fail_count = 0;
+                    session_fail_count = 0;
+                    unexpected_response_count = 0;
+                    session_query_method = SessionQueryMethod::Discover(0);
+                    last_session_recovery = None;
+                    if previous_mode.is_some() {
+                        session_event = None;
+                        drain_modem_session_events(&mut session_rx);
+                    }
                 }
             }
             Err(e) => {
@@ -146,186 +194,352 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             continue;
         };
 
-        // NDIS 断开事件直接触发恢复，跳过 IP 检查
-        if ndis_disconnected {
-            // 检查用户是否手动关闭了自动拨号，若关闭则不进行灾难恢复
-            if is_auto_dial_disabled(&at_client).await {
-                debug!("[monitor] NDIS disconnected but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
-                state = ConnectionState::Disconnected;
-                ping_fail_count = 0;
-                unexpected_response_count = 0;
-                active_interface = None;
-                continue;
-            }
-            if !matches!(state, ConnectionState::Disconnected) {
-                state = ConnectionState::Disconnected;
-            }
-            trigger_disaster_recovery(&config, &at_client, active_mode).await;
-            ping_fail_count = 0;
-            unexpected_response_count = 0;
-            active_interface = None;
-            continue;
-        }
-
-        // 常规轮询：检查 IP 状态
-        match check_ip_status(&at_client).await {
-            Ok(ip_status) => {
-                match ip_status {
-                    IpStatus::Unexpected => {
-                        unexpected_response_count += 1;
-                        warn!("AT+CGPADDR returned unexpected response. Count: {}/3", unexpected_response_count);
-                        if unexpected_response_count >= 3 {
-                            warn!("3 consecutive unexpected AT responses. Triggering disaster recovery.");
-                            trigger_disaster_recovery(&config, &at_client, active_mode).await;
-                            unexpected_response_count = 0;
-                            ping_fail_count = 0;
-                            state = ConnectionState::Disconnected;
-                            active_interface = None;
-                        }
+        if let Some(event) = session_event {
+            if !is_data_session_cid(event.cid) {
+                debug!(
+                    "Ignoring modem session event for unrelated cid {:?}; data cid is {}.",
+                    event.cid,
+                    DATA_CID
+                );
+            } else {
+                match event.state {
+                    ModemSessionState::Connected => {
+                        debug!(
+                            "[NDISSTAT] Modem session connected event received (cid={:?}).",
+                            event.cid
+                        );
                     }
-
-                    IpStatus::NoIp => {
-                        unexpected_response_count = 0;
-                        // 检查用户是否手动关闭了自动拨号，若关闭则不触发灾难恢复
-                        if is_auto_dial_disabled(&at_client).await {
-                            debug!("[monitor] No IP but AT^SETAUTODIAL=0 (user disabled). Skipping recovery.");
-                            state = ConnectionState::Disconnected;
-                            active_interface = None;
-                            continue;
-                        }
-                        if !matches!(state, ConnectionState::Disconnected) {
-                            warn!("Lost IP address. Resetting state and triggering disaster recovery.");
-                        } else {
-                            warn!("No IP address detected. Triggering disaster recovery.");
-                        }
-                        trigger_disaster_recovery(&config, &at_client, active_mode).await;
-                        ping_fail_count = 0;
+                    ModemSessionState::Connecting => {
+                        info!(
+                            "[NDISSTAT] Modem session is connecting (cid={:?}); waiting for completion.",
+                            event.cid
+                        );
                         state = ConnectionState::Disconnected;
                         active_interface = None;
+                        session_fail_count = 0;
+                        continue;
                     }
+                    ModemSessionState::Disconnected => {
+                        if is_auto_dial_disabled(&at_client).await {
+                            debug!("[monitor] Modem session disconnected while auto dial is disabled.");
+                            state = ConnectionState::Disconnected;
+                            active_interface = None;
+                            session_fail_count = 0;
+                            continue;
+                        }
 
-                    ref status if status.has_ip() => {
+                        if last_session_recovery
+                            .map(|last| last.elapsed() < Duration::from_secs(15))
+                            .unwrap_or(false)
+                        {
+                            debug!("Ignoring a delayed disconnect event from the recent recovery; polling current state.");
+                        } else {
+                            warn!(
+                                "[NDISSTAT] Modem session disconnected in {} mode; reconnecting session.",
+                                active_mode.label()
+                            );
+                            let recovered = recover_modem_session(&at_client, active_mode, false).await;
+                            session_query_method = SessionQueryMethod::Discover(0);
+                            last_session_recovery = Some(Instant::now());
+                            drain_modem_session_events(&mut session_rx);
+                            if !recovered {
+                                warn!("Modem session reconnect failed; retrying on a later poll.");
+                            }
+                            state = ConnectionState::Disconnected;
+                            active_interface = None;
+                            router_fail_count = 0;
+                            session_fail_count = 0;
+                            unexpected_response_count = 0;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        match check_data_session(
+            &at_client,
+            &mut session_query_method,
+            active_mode,
+        ).await {
+            Ok(DataSessionStatus::Connecting) => {
+                debug!("Modem data session is still connecting.");
+                state = ConnectionState::Disconnected;
+                active_interface = None;
+                session_fail_count = 0;
+                continue;
+            }
+            Ok(DataSessionStatus::Disconnected) => {
+                unexpected_response_count = 0;
+                router_fail_count = 0;
+                state = ConnectionState::Disconnected;
+                active_interface = None;
+
+                if is_auto_dial_disabled(&at_client).await {
+                    debug!("Modem session is down while auto dial is disabled.");
+                    session_fail_count = 0;
+                    continue;
+                }
+
+                session_fail_count = session_fail_count.saturating_add(1);
+                warn!(
+                    "Modem session is down in {} mode. Count: {}/3",
+                    active_mode.label(),
+                    session_fail_count
+                );
+                if session_fail_count >= 3 {
+                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    session_query_method = SessionQueryMethod::Discover(0);
+                    last_session_recovery = Some(Instant::now());
+                    drain_modem_session_events(&mut session_rx);
+                    if !recovered {
+                        warn!("Forced modem session recovery failed.");
+                    }
+                    session_fail_count = 0;
+                }
+            }
+            Ok(DataSessionStatus::NoAddress) => {
+                unexpected_response_count = 0;
+                state = ConnectionState::Disconnected;
+                active_interface = None;
+                if is_auto_dial_disabled(&at_client).await {
+                    debug!("Modem session has no address while auto dial is disabled.");
+                    session_fail_count = 0;
+                    continue;
+                }
+                session_fail_count = session_fail_count.saturating_add(1);
+                warn!(
+                    "Modem session reports connected but has no PDP address. Count: {}/3",
+                    session_fail_count
+                );
+                if session_fail_count >= 3 {
+                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    session_query_method = SessionQueryMethod::Discover(0);
+                    last_session_recovery = Some(Instant::now());
+                    drain_modem_session_events(&mut session_rx);
+                    if !recovered {
+                        warn!("Recovery of the address-less modem session failed.");
+                    }
+                    session_fail_count = 0;
+                }
+            }
+            Ok(DataSessionStatus::Unexpected) => {
+                unexpected_response_count = unexpected_response_count.saturating_add(1);
+                warn!(
+                    "Modem session probe returned an unexpected response. Count: {}/3",
+                    unexpected_response_count
+                );
+                if unexpected_response_count >= 3 {
+                    if is_auto_dial_disabled(&at_client).await {
+                        debug!("Skipping probe-failure recovery because auto dial is disabled.");
                         unexpected_response_count = 0;
-                        log_ip_status(status);
+                        continue;
+                    }
+                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                    session_query_method = SessionQueryMethod::Discover(0);
+                    last_session_recovery = Some(Instant::now());
+                    drain_modem_session_events(&mut session_rx);
+                    if !recovered {
+                        warn!("Modem session recovery after probe failures did not succeed.");
+                    }
+                    unexpected_response_count = 0;
+                    state = ConnectionState::Disconnected;
+                    active_interface = None;
+                }
+            }
+            Ok(DataSessionStatus::Connected(ref ip_status)) => {
+                session_fail_count = 0;
+                unexpected_response_count = 0;
+                log_ip_status(ip_status);
 
-                        match state {
-                            ConnectionState::Disconnected => {
-                                info!("IP address detected. Starting network setup...");
+                match state {
+                    ConnectionState::Disconnected => {
+                        info!("Modem session has an IP address. Preparing router data path...");
+                        let selection = match detect_data_interface(
+                            &config.advanced_network_config.ifname,
+                            active_mode,
+                        ).await {
+                            Ok(selection) => selection,
+                            Err(e) => {
+                                error!("Failed to select router data interface: {}", e);
+                                active_interface = None;
+                                continue;
+                            }
+                        };
+                        info!(
+                            "Using data device {} through OpenWrt interface {} for {} mode.",
+                            selection.device,
+                            selection.logical_interface,
+                            active_mode.label(),
+                        );
 
-                                debug!("Initializing modem URC reporting configs...");
-                                let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
-                                let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
-                                let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
-                                // 手册：AT+CPMS 的 mem3（接收存储）掉电不保存，重启后重置
-                                // mem1/mem2 上电后与上次 mem3 保持一致，因此三者都需重新下发
-                                let sms_mem = &config.advanced_network_config.sms_storage;
-                                let cpms_cmd = format!("AT+CPMS=\"{}\",\"{}\",\"{}\"", sms_mem, sms_mem, sms_mem);
-                                debug!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
-                                let _ = at_client.send_command(cpms_cmd).await;
+                        active_interface = Some(selection.clone());
+                        state = ConnectionState::DataPathConfigured;
 
-                                let selected_interface = match detect_data_interface(
-                                    &config.advanced_network_config.ifname,
-                                    active_mode,
-                                ).await {
-                                    Ok(selection) => selection,
-                                    Err(e) => {
-                                        error!("Failed to select data interface: {}", e);
-                                        state = ConnectionState::Disconnected;
-                                        active_interface = None;
-                                        continue;
-                                    }
-                                };
-                                info!(
-                                    "Using data device {} through OpenWrt interface {} for {} mode.",
-                                    selected_interface.device,
-                                    selected_interface.logical_interface,
-                                    active_mode.label(),
+                        if device_carrier_down(&selection.device).await {
+                            if active_mode == DataMode::Ethernet {
+                                warn!(
+                                    "Ethernet carrier is down on {} (device {}); waiting without redialing modem.",
+                                    selection.logical_interface,
+                                    selection.device
                                 );
-
-                                let setup_result = if selected_interface.managed {
-                                    network::setup_ipv4_only(&config, &selected_interface.device).await
-                                } else {
-                                    network::ensure_existing_ipv4_interface(
-                                        &selected_interface.logical_interface,
-                                    ).await
-                                };
-                                if let Err(e) = setup_result {
-                                    error!("Failed to setup IPv4 network: {}", e);
-                                    state = ConnectionState::Disconnected;
-                                    active_interface = None;
+                                if !selection.managed {
+                                    router_fail_count = 0;
                                     continue;
                                 }
-                                debug!("IPv4 setup done.");
-
-                                let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
-                                // ipv6_needed：配置了 v6 协议类型（ipv4v6 / ipv6）
-                                // 注意：不依赖 ipv6_present（AT+CGPADDR 可能只返回数据 PDP 的 IPv4，
-                                // IMS/IPv6 地址不一定出现在响应中），只要配置了就尝试注入
-                                let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
-
-                                if ipv6_needed && selected_interface.managed {
-                                    info!("IPv6 configured (pdp_type={}). Injecting IPv6 interface...", pdp_type);
-                                    if let Err(e) = network::inject_ipv6_interface(&config, &selected_interface.device).await {
-                                        error!("Failed to inject IPv6 interface: {}", e);
-                                    } else {
-                                        debug!("IPv6 Injection Completed.");
-                                    }
-                                } else if ipv6_needed {
-                                    debug!(
-                                        "Reusing existing OpenWrt interface {}; preserving its IPv6 configuration.",
-                                        selected_interface.logical_interface
-                                    );
-                                }
-
-                                active_interface = Some(selected_interface.clone());
-                                state = ConnectionState::DataPathConfigured;
-                                ping_fail_count = 0;
-                                info!(
-                                    "Network setup complete. Router data path is active on {} (device {}).",
-                                    selected_interface.logical_interface,
-                                    selected_interface.device,
+                            } else {
+                                warn!(
+                                    "USB data-interface carrier is down on {}. Count: 1/3",
+                                    selection.device
                                 );
                             }
+                        }
 
-                            ConnectionState::DataPathConfigured => {
-                                let Some(logical_interface) = active_interface
-                                    .as_ref()
-                                    .map(|selection| selection.logical_interface.clone())
-                                else {
-                                    state = ConnectionState::Disconnected;
-                                    continue;
-                                };
-                                if !check_router_network_status(&logical_interface).await {
-                                    ping_fail_count += 1;
+                        match configure_router_data_path(&config, &at_client, &selection).await {
+                            Ok(()) => {
+                                info!(
+                                    "Router data path is active on {} (device {}, mode {}).",
+                                    selection.logical_interface,
+                                    selection.device,
+                                    active_mode.label()
+                                );
+                                router_fail_count = 0;
+                            }
+                            Err(e) => {
+                                error!("Failed to prepare router data path: {}", e);
+                                router_fail_count = 1;
+                            }
+                        }
+                    }
+                    ConnectionState::DataPathConfigured => {
+                        let Some(selection) = active_interface.clone() else {
+                            state = ConnectionState::Disconnected;
+                            continue;
+                        };
+                        let link_status = check_router_network_status(&selection).await;
+                        match link_status {
+                            RouterLinkStatus::Ready => {
+                                if router_fail_count > 0 {
+                                    info!("Router-side data path recovered on {}.", selection.logical_interface);
+                                }
+                                router_fail_count = 0;
+                            }
+                            RouterLinkStatus::CarrierDown => {
+                                if active_mode == DataMode::Ethernet {
+                                    router_fail_count = 0;
                                     warn!(
-                                        "Router-side network check failed on {}. Count: {}/3",
-                                        logical_interface,
-                                        ping_fail_count
+                                        "Ethernet carrier is down on {} (device {}); waiting without redialing modem.",
+                                        selection.logical_interface,
+                                        selection.device
                                     );
-                                    if ping_fail_count >= 3 {
-                                        warn!("Continuous 3 router-side failures detected! Triggering disaster recovery.");
-                                        trigger_disaster_recovery(&config, &at_client, active_mode).await;
-                                        ping_fail_count = 0;
+                                } else {
+                                    router_fail_count = router_fail_count.saturating_add(1);
+                                    warn!(
+                                        "USB data-interface carrier is down on {}. Count: {}/3",
+                                        selection.device,
+                                        router_fail_count
+                                    );
+                                    if router_fail_count >= 3 {
+                                        if is_auto_dial_disabled(&at_client).await {
+                                            debug!("Skipping USB session recovery because auto dial is disabled.");
+                                            router_fail_count = 0;
+                                            continue;
+                                        }
+                                        let recovered = recover_modem_session(&at_client, active_mode, true).await;
+                                        session_query_method = SessionQueryMethod::Discover(0);
+                                        last_session_recovery = Some(Instant::now());
+                                        drain_modem_session_events(&mut session_rx);
+                                        if !recovered {
+                                            warn!("USB data-session recovery failed.");
+                                        }
                                         state = ConnectionState::Disconnected;
                                         active_interface = None;
-                                        continue;
+                                        router_fail_count = 0;
                                     }
-                                } else if ping_fail_count > 0 {
-                                    debug!("Router-side network recovered. Resetting failure count.");
-                                    ping_fail_count = 0;
+                                }
+                            }
+                            RouterLinkStatus::DeviceMissing => {
+                                warn!(
+                                    "Router data device {} disappeared; waiting for interface detection.",
+                                    selection.device
+                                );
+                                state = ConnectionState::Disconnected;
+                                active_interface = None;
+                                router_fail_count = 0;
+                            }
+                            failure => {
+                                router_fail_count = router_fail_count.saturating_add(1);
+                                warn!(
+                                    "Router-side {} on {} (mode {}). Count: {}/3",
+                                    failure.label(),
+                                    selection.logical_interface,
+                                    active_mode.label(),
+                                    router_fail_count
+                                );
+                                if router_fail_count >= 3 {
+                                    warn!(
+                                        "Restarting OpenWrt interface {} without redialing the modem session.",
+                                        selection.logical_interface
+                                    );
+                                    match network::restart_ipv4_interface(&selection.logical_interface).await {
+                                        Ok(()) => {
+                                            info!("OpenWrt interface {} recovered.", selection.logical_interface);
+                                            router_fail_count = 0;
+                                        }
+                                        Err(e) => {
+                                            warn!("OpenWrt interface recovery failed: {}", e);
+                                            state = ConnectionState::Disconnected;
+                                            active_interface = None;
+                                            router_fail_count = 0;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-
-                    _ => {}
                 }
             }
             Err(e) => {
-                warn!("Failed to check IP status: {}. Retrying later.", e);
+                warn!("Failed to probe modem data session: {}", e);
             }
         }
     }
+}
+
+async fn configure_router_data_path(
+    config: &Config,
+    at_client: &ATClient,
+    selection: &DataInterface,
+) -> Result<()> {
+    debug!("Initializing modem URC reporting configs...");
+    let _ = at_client.send_command("AT+CNMI=2,1,0,2,0".to_string()).await;
+    let _ = at_client.send_command("AT+CMGF=0".to_string()).await;
+    let _ = at_client.send_command("AT+CLIP=1".to_string()).await;
+
+    let sms_mem = &config.advanced_network_config.sms_storage;
+    let cpms_cmd = format!("AT+CPMS=\"{}\",\"{}\",\"{}\"", sms_mem, sms_mem, sms_mem);
+    let _ = at_client.send_command(cpms_cmd).await;
+
+    if selection.managed {
+        network::setup_ipv4_only(config, &selection.device).await?;
+    } else {
+        network::ensure_existing_ipv4_interface(&selection.logical_interface).await?;
+    }
+
+    let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
+    let ipv6_needed = pdp_type.contains("v6") || pdp_type.contains("ipv6");
+    if ipv6_needed && selection.managed {
+        if let Err(e) = network::inject_ipv6_interface(config, &selection.device).await {
+            error!("Failed to inject IPv6 interface: {}", e);
+        }
+    } else if ipv6_needed {
+        debug!(
+            "Reusing existing OpenWrt interface {}; preserving its IPv6 configuration.",
+            selection.logical_interface
+        );
+    }
+
+    Ok(())
 }
 
 /// 打印当前 IP 状态到日志
@@ -338,67 +552,243 @@ fn log_ip_status(status: &IpStatus) {
     }
 }
 
-async fn check_router_network_status(interface: &str) -> bool {
-    // 1) 检查实际使用的 OpenWrt 逻辑接口状态（路由侧）
-    let status_out = Command::new("ifstatus")
-        .arg(interface)
-        .output()
-        .await;
-
-    let output = match status_out {
-        Ok(o) if o.status.success() => o,
-        _ => {
-            warn!("ifstatus {} failed.", interface);
-            return false;
-        }
-    };
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!("Failed to parse ifstatus {} JSON: {}", interface, e);
-            return false;
-        }
-    };
-
-    let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
-    if !up {
-        warn!("{} is down.", interface);
-        return false;
+async fn check_router_network_status(selection: &DataInterface) -> RouterLinkStatus {
+    let device_path = format!("/sys/class/net/{}", selection.device);
+    if fs::metadata(&device_path).await.is_err() {
+        return RouterLinkStatus::DeviceMissing;
     }
 
-    // 2) 需要有 IPv4 地址，且有默认路由（target=0.0.0.0）
-    let has_ipv4 = v.get("ipv4-address")
-        .and_then(|x| x.as_array())
-        .map(|arr| !arr.is_empty())
-        .unwrap_or(false);
+    if device_carrier_down(&selection.device).await {
+        return RouterLinkStatus::CarrierDown;
+    }
 
-    let has_default_route = v.get("route")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter().any(|r| {
-                r.get("target")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == "0.0.0.0")
+    let output = match Command::new("ifstatus")
+        .arg(&selection.logical_interface)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return RouterLinkStatus::InterfaceUnavailable,
+    };
+    let status: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(status) => status,
+        Err(_) => return RouterLinkStatus::InterfaceUnavailable,
+    };
+
+    if !status.get("up").and_then(|value| value.as_bool()).unwrap_or(false) {
+        return RouterLinkStatus::InterfaceDown;
+    }
+    let has_ipv4 = status
+        .get("ipv4-address")
+        .and_then(|value| value.as_array())
+        .map(|addresses| !addresses.is_empty())
+        .unwrap_or(false);
+    if !has_ipv4 {
+        return RouterLinkStatus::MissingIpv4;
+    }
+    let has_default_route = status
+        .get("route")
+        .and_then(|value| value.as_array())
+        .map(|routes| {
+            routes.iter().any(|route| {
+                route
+                    .get("target")
+                    .and_then(|target| target.as_str())
+                    .map(|target| target == "0.0.0.0")
                     .unwrap_or(false)
             })
         })
         .unwrap_or(false);
+    if !has_default_route {
+        return RouterLinkStatus::MissingDefaultRoute;
+    }
 
-    if has_ipv4 && has_default_route {
-        debug!(
-            "Router-side network status OK ({} up + IPv4 + default route).",
-            interface
-        );
-        true
+    RouterLinkStatus::Ready
+}
+
+async fn device_carrier_down(device: &str) -> bool {
+    fs::read_to_string(format!("/sys/class/net/{}/carrier", device))
+        .await
+        .map(|carrier| carrier.trim() == "0")
+        .unwrap_or(false)
+}
+
+async fn check_data_session(
+    at_client: &ATClient,
+    query_method: &mut SessionQueryMethod,
+    data_mode: DataMode,
+) -> Result<DataSessionStatus> {
+    let queried_state = query_modem_session_state(at_client, query_method).await;
+    if let Some(status) = authoritative_session_status(data_mode, queried_state) {
+        return Ok(status);
+    }
+
+    Ok(resolve_ip_session_status(
+        queried_state,
+        check_ip_status(at_client).await?,
+    ))
+}
+
+fn authoritative_session_status(
+    data_mode: DataMode,
+    queried_state: Option<ModemSessionState>,
+) -> Option<DataSessionStatus> {
+    if data_mode != DataMode::Usb {
+        return None;
+    }
+
+    match queried_state {
+        Some(ModemSessionState::Disconnected) => Some(DataSessionStatus::Disconnected),
+        Some(ModemSessionState::Connecting) => Some(DataSessionStatus::Connecting),
+        _ => None,
+    }
+}
+
+fn resolve_ip_session_status(
+    queried_state: Option<ModemSessionState>,
+    ip_status: IpStatus,
+) -> DataSessionStatus {
+    match ip_status {
+        status if status.has_ip() => DataSessionStatus::Connected(status),
+        IpStatus::NoIp if queried_state == Some(ModemSessionState::Disconnected) => {
+            DataSessionStatus::Disconnected
+        }
+        IpStatus::NoIp if queried_state == Some(ModemSessionState::Connecting) => {
+            DataSessionStatus::Connecting
+        }
+        IpStatus::NoIp if queried_state == Some(ModemSessionState::Connected) => {
+            DataSessionStatus::NoAddress
+        }
+        IpStatus::NoIp => DataSessionStatus::Disconnected,
+        IpStatus::Unexpected => DataSessionStatus::Unexpected,
+        _ => DataSessionStatus::Unexpected,
+    }
+}
+
+async fn query_modem_session_state(
+    at_client: &ATClient,
+    query_method: &mut SessionQueryMethod,
+) -> Option<ModemSessionState> {
+    match *query_method {
+        SessionQueryMethod::Unsupported => None,
+        SessionQueryMethod::QueryAll => {
+            match try_session_query(at_client, "AT^NDISSTATQRY?").await {
+                Some(state) => Some(state),
+                None => {
+                    warn!("AT^NDISSTATQRY? stopped returning valid data; rediscovering query support.");
+                    *query_method = SessionQueryMethod::Discover(1);
+                    None
+                }
+            }
+        }
+        SessionQueryMethod::QueryCid => {
+            let command = format!("AT^NDISSTATQRY={}", DATA_CID);
+            match try_session_query(at_client, &command).await {
+                Some(state) => Some(state),
+                None => {
+                    warn!(
+                        "AT^NDISSTATQRY={} stopped returning valid data; rediscovering query support.",
+                        DATA_CID
+                    );
+                    *query_method = SessionQueryMethod::Discover(1);
+                    None
+                }
+            }
+        }
+        SessionQueryMethod::Discover(failure_count) => {
+            if let Some(state) = try_session_query(at_client, "AT^NDISSTATQRY?").await {
+                info!("Using AT^NDISSTATQRY? for modem data-session polling.");
+                *query_method = SessionQueryMethod::QueryAll;
+                return Some(state);
+            }
+            let command = format!("AT^NDISSTATQRY={}", DATA_CID);
+            if let Some(state) = try_session_query(at_client, &command).await {
+                info!(
+                    "Using AT^NDISSTATQRY={} for modem data-session polling.",
+                    DATA_CID
+                );
+                *query_method = SessionQueryMethod::QueryCid;
+                return Some(state);
+            }
+
+            let failure_count = failure_count.saturating_add(1);
+            if failure_count >= SESSION_QUERY_FAILURE_LIMIT {
+                info!(
+                    "NDISSTATQRY returned no valid state for {} consecutive probes; using CGPADDR as the modem session fallback.",
+                    failure_count
+                );
+                *query_method = SessionQueryMethod::Unsupported;
+            } else {
+                warn!(
+                    "NDISSTATQRY probe failed ({}/{}); retrying discovery on the next poll.",
+                    failure_count,
+                    SESSION_QUERY_FAILURE_LIMIT
+                );
+                *query_method = SessionQueryMethod::Discover(failure_count);
+            }
+            None
+        }
+    }
+}
+
+async fn try_session_query(at_client: &ATClient, command: &str) -> Option<ModemSessionState> {
+    let response = at_client.send_command(command.to_string()).await.ok()?;
+    if !response.success {
+        return None;
+    }
+    parse_ndis_query_state(response.data.as_deref()?, DATA_CID)
+}
+
+fn parse_ndis_query_state(data: &str, target_cid: u8) -> Option<ModemSessionState> {
+    let statuses: Vec<u8> = data
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("^NDISSTATQRY:")
+                .map(str::trim)
+        })
+        .flat_map(|payload| parse_ndis_query_payload(payload, target_cid))
+        .collect();
+    aggregate_ndis_states(&statuses)
+}
+
+fn parse_ndis_query_payload(payload: &str, target_cid: u8) -> Vec<u8> {
+    let fields: Vec<&str> = payload.split(',').map(str::trim).collect();
+    if fields.is_empty() {
+        return Vec::new();
+    }
+
+    let cid_prefixed = fields.len() >= 5 && fields.len() % 5 == 0;
+    if cid_prefixed {
+        fields
+            .chunks(5)
+            .filter_map(|group| {
+                let cid = group.first()?.parse::<u8>().ok()?;
+                (cid == target_cid)
+                    .then(|| group.get(1)?.parse::<u8>().ok())
+                    .flatten()
+            })
+            .collect()
     } else {
-        warn!(
-            "Router-side network status not ready: ipv4={}, default_route={}",
-            has_ipv4,
-            has_default_route
-        );
-        false
+        fields
+            .chunks(4)
+            .filter_map(|group| group.first()?.parse::<u8>().ok())
+            .collect()
+    }
+}
+
+fn aggregate_ndis_states(statuses: &[u8]) -> Option<ModemSessionState> {
+    if statuses.is_empty() {
+        return None;
+    }
+    if statuses.iter().any(|status| *status == 1) {
+        Some(ModemSessionState::Connected)
+    } else if statuses.iter().any(|status| *status == 2) {
+        Some(ModemSessionState::Connecting)
+    } else if statuses.iter().all(|status| matches!(status, 0 | 3)) {
+        Some(ModemSessionState::Disconnected)
+    } else {
+        None
     }
 }
 
@@ -417,25 +807,38 @@ async fn check_ip_status(at_client: &ATClient) -> Result<IpStatus> {
 
     debug!("IP Check Response: {}", content);
 
+    let status = parse_ip_status(&content, DATA_CID);
+    if status == IpStatus::Unexpected {
+        warn!(
+            "AT+CGPADDR response contains no +CGPADDR line: {}",
+            content.replace(['\n', '\r'], " ")
+        );
+    }
+    Ok(status)
+}
+
+fn parse_ip_status(content: &str, target_cid: u8) -> IpStatus {
     let mut found_v4: Option<String> = None;
     let mut found_v6: Option<String> = None;
     let mut has_cgpaddr_line = false;
 
     for line in content.lines() {
         let line = line.trim();
-        if !line.starts_with("+CGPADDR:") {
+        let Some(payload) = line.strip_prefix("+CGPADDR:") else {
             continue;
-        }
+        };
         has_cgpaddr_line = true;
 
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() < 2 {
+        let mut segments = payload.split(',').map(str::trim);
+        let cid = segments
+            .next()
+            .map(|value| value.trim_matches('"'))
+            .and_then(|value| value.parse::<u8>().ok());
+        if cid != Some(target_cid) {
             continue;
         }
 
-        let segments: Vec<&str> = parts[1].split(',').collect();
-        // segments[0] 是 PDP 索引，从 [1] 开始是 IP
-        for segment in segments.iter().skip(1) {
+        for segment in segments {
             let clean_ip = segment.trim_matches(|c| c == '"' || c == ' ' || c == '\r' || c == '\n');
 
             if clean_ip.is_empty() || clean_ip == "0.0.0.0" || clean_ip == "::" {
@@ -471,32 +874,20 @@ async fn check_ip_status(at_client: &ATClient) -> Result<IpStatus> {
         }
     }
 
-    // 如果根本没有 +CGPADDR: 行，视为异常响应
     if !has_cgpaddr_line {
-        warn!("AT+CGPADDR response contains no +CGPADDR line: {}", content.replace('\n', " ").replace('\r', " "));
-        return Ok(IpStatus::Unexpected);
+        return IpStatus::Unexpected;
     }
 
-    Ok(match (found_v4, found_v6) {
+    match (found_v4, found_v6) {
         (Some(v4), Some(v6)) => IpStatus::DualStack(v4, v6),
         (Some(v4), None)     => IpStatus::Ipv4Only(v4),
         (None,     Some(v6)) => IpStatus::Ipv6Only(v6),
         (None,     None)     => IpStatus::NoIp,
-    })
+    }
 }
 
-/// MT5700M-CN 专用拨号函数。
-///
-/// 设计原则：后端不主动修改或激活 PDP 上下文。
-/// PDP 配置（AT+CGDCONT）和激活（AT+CGACT）由用户在前端完成，
-/// 模组内部已保存的 PDP 数据会在 NDISDUP 时自动使用。
-/// 后端只负责建立 NDIS 数据通道（AT^NDISDUP=1,1）。
-async fn perform_dial(_config: &Config, at_client: &ATClient) -> Result<()> {
-    // 手册：NDISDUP 是异步AT，OK 只代表发送成功
-    // 实际连接建立由 ^NDISSTAT: 1 URC 确认
-    info!("[dial] Establishing NDIS data channel (AT^NDISDUP=1,1)...");
-    let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
-    Ok(())
+fn is_data_session_cid(cid: Option<u8>) -> bool {
+    cid.map(|value| value == DATA_CID).unwrap_or(true)
 }
 
 /// 检查模组是否已被用户手动关闭自动拨号（AT^SETAUTODIAL=0）
@@ -514,71 +905,71 @@ async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
     false // 查询失败时保守处理，不阻止恢复
 }
 
-/// 精简灾难恢复入口（只保留最有效、最快路径）
-///
-/// 快速恢复步骤：
-/// 1) 重建 NDIS 通道（AT^NDISDUP=1,0 -> AT^NDISDUP=1,1）
-/// 2) 重启路由侧网卡（ip link down/up）
-///
-/// 不再执行 HVSST/CFUN/CGATT/模组复位等慢恢复流程。
-async fn trigger_disaster_recovery(
-    config: &Config,
+/// Recover only the modem-side data session. Router interface recovery is kept
+/// separate so DHCP/default-route failures never cause an unnecessary redial.
+async fn recover_modem_session(
     at_client: &ATClient,
     data_mode: DataMode,
-) {
-    warn!("[FAST-RECOVERY] Rebuilding NDIS channel and restarting interface...");
+    force_reset: bool,
+) -> bool {
+    warn!(
+        "Recovering modem data session for {} mode (force_reset={}).",
+        data_mode.label(),
+        force_reset
+    );
 
-    if try_dial_and_bind(config, at_client, data_mode).await {
-        info!("[FAST-RECOVERY] Recovery succeeded.");
+    if force_reset {
+        let disconnect_command = format!("AT^NDISDUP={},0", DATA_CID);
+        match at_client.send_command(disconnect_command).await {
+            Ok(response) if response.success => sleep(Duration::from_secs(2)).await,
+            Ok(response) => debug!(
+                "Session disconnect command was not accepted: {}",
+                response.error.unwrap_or_else(|| "unknown error".to_string())
+            ),
+            Err(e) => warn!("Failed to send session disconnect command: {}", e),
+        }
+    }
+
+    let connect_command = format!("AT^NDISDUP={},1", DATA_CID);
+    match at_client.send_command(connect_command).await {
+        Ok(response) if response.success => {}
+        Ok(response) => {
+            warn!(
+                "Session connect command failed: {}",
+                response.error.unwrap_or_else(|| "unknown error".to_string())
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!("Failed to send session connect command: {}", e);
+            return false;
+        }
+    }
+
+    if wait_for_ip(at_client).await {
+        info!("Modem data session recovered for {} mode.", data_mode.label());
+        true
     } else {
-        warn!("[FAST-RECOVERY] Recovery failed this round; will retry on next monitor cycle.");
+        warn!("Timed out waiting for modem data-session address.");
+        return false;
     }
 }
 
-/// 执行拨号并绑定数据通道，返回 true 表示成功
-/// 注意：调用此函数前已确认 SETAUTODIAL != 0
-async fn try_dial_and_bind(
-    config: &Config,
-    at_client: &ATClient,
-    data_mode: DataMode,
-) -> bool {
-    // 断开旧 NDIS 连接
-    // 手册：NDISDUP 是异步AT，断开后需等待 ^NDISSTAT: 0，此处用 sleep 兜底
-    let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
-    sleep(Duration::from_secs(2)).await;
-
-    // perform_dial 只建立 NDIS 通道，PDP 由模组内部数据驱动
-    if let Err(e) = perform_dial(config, at_client).await {
-        warn!("[dial] perform_dial failed: {}", e);
-    }
-
-    if !wait_for_ip(at_client).await {
-        warn!("[dial] Timed out waiting for IP.");
-        return false;
-    }
-    info!("[dial] IP obtained. Binding NDIS channel...");
-    // 手册：NDISDUP 是异步AT，sleep 5s 等待 ^NDISSTAT: 1 及 DHCP 就绪
-    let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
-    sleep(Duration::from_secs(5)).await;
-    let selected_interface = match detect_data_interface(
-        &config.advanced_network_config.ifname,
-        data_mode,
-    ).await {
-        Ok(selection) => selection,
-        Err(e) => {
-            error!("[dial] Failed to select data interface: {}", e);
-            return false;
+fn drain_modem_session_events(
+    receiver: &mut tokio::sync::broadcast::Receiver<crate::models::ModemSessionEvent>,
+) {
+    let mut drained = 0u32;
+    loop {
+        match receiver.try_recv() {
+            Ok(_) => drained += 1,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => drained += n as u32,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         }
-    };
-    let _ = Command::new("ip").args(&["link", "set", "dev", &selected_interface.device, "down"]).status().await;
-    sleep(Duration::from_secs(1)).await;
-    let _ = Command::new("ip").args(&["link", "set", "dev", &selected_interface.device, "up"]).status().await;
-    info!(
-        "[dial] Device {} restarted for OpenWrt interface {}. Recovery complete.",
-        selected_interface.device,
-        selected_interface.logical_interface
-    );
-    true
+    }
+    if drained > 0 {
+        debug!("Drained {} session event(s) generated during recovery.", drained);
+    }
 }
 
 /// 等待有效 IP，参考 QModem 增加 120 秒超时熔断
@@ -915,6 +1306,126 @@ mod tests {
         assert_eq!(
             interface_status_devices(&status).collect::<Vec<_>>(),
             vec!["eth1".to_string(), "pppoe-wan".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_dual_stack_ndis_query_state() {
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 0,,,\"IPV4\",1,,,\"IPV6\"\r\nOK",
+                DATA_CID,
+            ),
+            Some(ModemSessionState::Connected)
+        );
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 0,,,\"IPV4\"\r\n^NDISSTATQRY: 2,,,\"IPV6\"\r\nOK",
+                DATA_CID,
+            ),
+            Some(ModemSessionState::Connecting)
+        );
+    }
+
+    #[test]
+    fn parses_cid_prefixed_ndis_query_state() {
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 1,3,29,,\"IPV4V6\"\r\nOK",
+                DATA_CID,
+            ),
+            Some(ModemSessionState::Disconnected)
+        );
+    }
+
+    #[test]
+    fn ndis_query_uses_only_the_data_cid() {
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 2,1,,,\"IPV4\"\r\n^NDISSTATQRY: 1,0,29,,\"IPV4V6\"\r\nOK",
+                DATA_CID,
+            ),
+            Some(ModemSessionState::Disconnected)
+        );
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 5,1,,,\"IPV4\"\r\nOK",
+                DATA_CID,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cgpaddr_ignores_ims_and_other_cids() {
+        let response = "+CGPADDR: 1\r\n+CGPADDR: 5,10.10.10.5\r\nOK";
+        assert_eq!(parse_ip_status(response, DATA_CID), IpStatus::NoIp);
+    }
+
+    #[test]
+    fn cgpaddr_parses_data_cid_dual_stack_addresses() {
+        let response = concat!(
+            "+CGPADDR: 5,10.10.10.5\r\n",
+            "+CGPADDR: 1,100.64.1.2,",
+            "32.8.0.2.0.2.0.1.255.255.255.255.255.255.255.255\r\n",
+            "OK"
+        );
+        assert_eq!(
+            parse_ip_status(response, DATA_CID),
+            IpStatus::DualStack(
+                "100.64.1.2".to_string(),
+                "32.8.0.2.0.2.0.1.255.255.255.255.255.255.255.255".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn cgpaddr_without_result_lines_is_unexpected() {
+        assert_eq!(parse_ip_status("OK", DATA_CID), IpStatus::Unexpected);
+    }
+
+    #[test]
+    fn session_events_without_cid_target_the_primary_data_session() {
+        assert!(is_data_session_cid(None));
+        assert!(is_data_session_cid(Some(DATA_CID)));
+        assert!(!is_data_session_cid(Some(5)));
+    }
+
+    #[test]
+    fn usb_mode_treats_session_query_disconnect_as_authoritative() {
+        assert_eq!(
+            authoritative_session_status(
+                DataMode::Usb,
+                Some(ModemSessionState::Disconnected),
+            ),
+            Some(DataSessionStatus::Disconnected)
+        );
+        assert_eq!(
+            authoritative_session_status(
+                DataMode::Ethernet,
+                Some(ModemSessionState::Disconnected),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ethernet_mode_accepts_data_cid_address_over_stale_query_state() {
+        let ip_status = IpStatus::Ipv4Only("100.64.1.2".to_string());
+        assert_eq!(
+            resolve_ip_session_status(
+                Some(ModemSessionState::Disconnected),
+                ip_status.clone(),
+            ),
+            DataSessionStatus::Connected(ip_status)
+        );
+    }
+
+    #[test]
+    fn connected_session_without_data_cid_address_is_not_ready() {
+        assert_eq!(
+            resolve_ip_session_status(Some(ModemSessionState::Connected), IpStatus::NoIp),
+            DataSessionStatus::NoAddress
         );
     }
 }

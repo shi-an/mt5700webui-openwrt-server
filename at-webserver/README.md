@@ -69,7 +69,13 @@ config at-webserver 'config'
 
 默认控制连接为 `SERIAL + auto`。后端优先枚举 VID `3466` 下的 `ttyUSB*`/`ttyACM*`，逐个发送 `AT`，仅使用返回完整 `OK` 的控制通道。宽带与模组组成多 WAN 时，应将 `ifname` 设置为模组对应的逻辑接口（如 `wan2`）；填写未配置的物理口（如 `eth2`）时，后端会创建并管理 `wan_modem`。
 
-`AT+CGPADDR` 只表示模组侧 PDP 已取得地址。后端还会等待 OpenWrt 接口取得 IPv4 地址和默认路由，成功后才将数据链路标记为可用。
+后端将健康状态分为三层，避免把路由侧 DHCP 故障误判为模组掉线：
+
+1. **工作模式**：定期查询 `AT^SETAUTODIAL?`，区分 USB 虚拟网卡和转网口模式。
+2. **模组数据会话**：只跟踪数据 CID `1`。优先使用 `^NDISSTAT` / `AT^NDISSTATQRY` 判断连接、连接中和断开状态，并用 `AT+CGPADDR` 的 CID `1` 地址交叉确认；IMS 等其他 CID 不会触发重拨。
+3. **路由侧链路**：检查对应 OpenWrt 接口的 carrier、IPv4 地址和默认路由。IPv4 或路由连续异常时只重启该逻辑接口；转网口模式的网线 carrier 断开时只等待链路恢复，不重拨模组。
+
+只有 CID `1` 会话确认断开、持续无地址或连续探测异常，以及 USB 数据接口 carrier 连续异常时，后端才通过 `AT^NDISDUP=1,0/1` 重建数据会话。恢复流程不会执行模组重启、`AT+CFUN` 或 OpenWrt 整机重启。
 
 ## 📦 依赖包
 
