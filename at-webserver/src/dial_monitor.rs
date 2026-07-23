@@ -6,7 +6,7 @@ use log::{info, warn, error, debug};
 use std::time::Duration;
 use tokio::time::{sleep, interval};
 use tokio::process::Command;
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
 use tokio::fs;
 
@@ -33,7 +33,22 @@ impl IpStatus {
 
 enum ConnectionState {
     Disconnected,
-    FullStackConfigured,
+    DataPathConfigured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataMode {
+    Usb,
+    Ethernet,
+}
+
+impl DataMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Usb => "USB virtual network interface",
+            Self::Ethernet => "Ethernet port",
+        }
+    }
 }
 
 pub async fn start_monitor(config: Config, at_client: ATClient) {
@@ -42,6 +57,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
     let mut state = ConnectionState::Disconnected;
     let mut ping_fail_count = 0u32;
     let mut unexpected_response_count = 0u32;
+    let mut data_mode: Option<DataMode> = None;
 
     // 订阅 ^NDISSTAT 断开事件，断线时无需等待轮询立即响应
     let ndis_tx = get_ndis_disconnect_tx();
@@ -49,7 +65,6 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
 
     // 10 秒轮询定时器
     let mut poll_timer = interval(Duration::from_secs(10));
-    poll_timer.tick().await; // 消耗第一个立即触发的 tick
 
     loop {
         // 同时等待：轮询定时器 或 NDIS 断开事件（哪个先到处理哪个）
@@ -72,6 +87,38 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             }
         };
 
+        // The modem explicitly reports whether data uses a USB virtual NIC or
+        // the external Ethernet port. Refresh before every health check so a
+        // modem reboot or mode switch cannot leave us managing the wrong interface.
+        match detect_data_mode(&at_client).await {
+            Ok(detected) => {
+                if data_mode != Some(detected) {
+                    if let Some(previous) = data_mode {
+                        warn!(
+                            "Modem data mode changed: {} -> {}.",
+                            previous.label(),
+                            detected.label()
+                        );
+                        let _ = network::teardown_modem_network().await;
+                    } else {
+                        info!("Detected modem data mode: {}.", detected.label());
+                    }
+                    data_mode = Some(detected);
+                    state = ConnectionState::Disconnected;
+                }
+            }
+            Err(e) => {
+                warn!("Unable to determine modem data mode: {}", e);
+                if data_mode.is_none() {
+                    continue;
+                }
+            }
+        }
+
+        let Some(active_mode) = data_mode else {
+            continue;
+        };
+
         // NDIS 断开事件直接触发恢复，跳过 IP 检查
         if ndis_disconnected {
             // 检查用户是否手动关闭了自动拨号，若关闭则不进行灾难恢复
@@ -85,7 +132,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             if !matches!(state, ConnectionState::Disconnected) {
                 state = ConnectionState::Disconnected;
             }
-            trigger_disaster_recovery(&config, &at_client).await;
+            trigger_disaster_recovery(&config, &at_client, active_mode).await;
             ping_fail_count = 0;
             unexpected_response_count = 0;
             continue;
@@ -100,7 +147,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         warn!("AT+CGPADDR returned unexpected response. Count: {}/3", unexpected_response_count);
                         if unexpected_response_count >= 3 {
                             warn!("3 consecutive unexpected AT responses. Triggering disaster recovery.");
-                            trigger_disaster_recovery(&config, &at_client).await;
+                            trigger_disaster_recovery(&config, &at_client, active_mode).await;
                             unexpected_response_count = 0;
                             ping_fail_count = 0;
                             state = ConnectionState::Disconnected;
@@ -117,11 +164,10 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         }
                         if !matches!(state, ConnectionState::Disconnected) {
                             warn!("Lost IP address. Resetting state and triggering disaster recovery.");
-                            state = ConnectionState::Disconnected;
                         } else {
                             warn!("No IP address detected. Triggering disaster recovery.");
                         }
-                        trigger_disaster_recovery(&config, &at_client).await;
+                        trigger_disaster_recovery(&config, &at_client, active_mode).await;
                         ping_fail_count = 0;
                         state = ConnectionState::Disconnected;
                     }
@@ -145,14 +191,29 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                 debug!("Setting SMS storage to {} (AT+CPMS)...", sms_mem);
                                 let _ = at_client.send_command(cpms_cmd).await;
 
-                                let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
-                                debug!("Auto-detected 5G interface: {}", actual_ifname);
+                                let actual_ifname = match detect_data_ifname(
+                                    &config.advanced_network_config.ifname,
+                                    active_mode,
+                                ).await {
+                                    Ok(ifname) => ifname,
+                                    Err(e) => {
+                                        error!("Failed to select data interface: {}", e);
+                                        state = ConnectionState::Disconnected;
+                                        continue;
+                                    }
+                                };
+                                info!(
+                                    "Using data interface {} for {} mode.",
+                                    actual_ifname,
+                                    active_mode.label()
+                                );
 
                                 if let Err(e) = network::setup_ipv4_only(&config, &actual_ifname).await {
                                     error!("Failed to setup IPv4 network: {}", e);
-                                } else {
-                                    debug!("IPv4 setup done.");
+                                    state = ConnectionState::Disconnected;
+                                    continue;
                                 }
+                                debug!("IPv4 setup done.");
 
                                 let pdp_type = config.advanced_network_config.pdp_type.to_lowercase();
                                 // ipv6_needed：配置了 v6 协议类型（ipv4v6 / ipv6）
@@ -169,18 +230,21 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                     }
                                 }
 
-                                state = ConnectionState::FullStackConfigured;
+                                state = ConnectionState::DataPathConfigured;
                                 ping_fail_count = 0;
-                                info!("Network setup complete. Full stack active.");
+                                info!(
+                                    "Network setup complete. Router data path is active on {}.",
+                                    actual_ifname
+                                );
                             }
 
-                            ConnectionState::FullStackConfigured => {
+                            ConnectionState::DataPathConfigured => {
                                 if !check_router_network_status(&config).await {
                                     ping_fail_count += 1;
                                     warn!("Router-side network check failed. Count: {}/3", ping_fail_count);
                                     if ping_fail_count >= 3 {
                                         warn!("Continuous 3 router-side failures detected! Triggering disaster recovery.");
-                                        trigger_disaster_recovery(&config, &at_client).await;
+                                        trigger_disaster_recovery(&config, &at_client, active_mode).await;
                                         ping_fail_count = 0;
                                         state = ConnectionState::Disconnected;
                                         continue;
@@ -377,15 +441,10 @@ async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
     let resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
     if let Ok(r) = resp {
         if let Some(data) = r.data {
-            // 手册响应格式：^SETAUTODAIL:<enable> 或 ^SETAUTODIAL:<enable>,...
-            return data.lines().any(|line| {
-                let l = line.trim();
-                (l.starts_with("^SETAUTODIAL:") || l.starts_with("^SETAUTODAIL:"))
-                    && l.split(':').nth(1)
-                        .and_then(|v| v.split(',').next())
-                        .map(|e| e.trim() == "0")
-                        .unwrap_or(false)
-            });
+            // Some firmware spells the prefix as SETAUTODAIL.
+            return parse_auto_dial_enabled(&data)
+                .map(|enabled| enabled == 0)
+                .unwrap_or(false);
         }
     }
     false // 查询失败时保守处理，不阻止恢复
@@ -398,10 +457,14 @@ async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
 /// 2) 重启路由侧网卡（ip link down/up）
 ///
 /// 不再执行 HVSST/CFUN/CGATT/模组复位等慢恢复流程。
-async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
+async fn trigger_disaster_recovery(
+    config: &Config,
+    at_client: &ATClient,
+    data_mode: DataMode,
+) {
     warn!("[FAST-RECOVERY] Rebuilding NDIS channel and restarting interface...");
 
-    if try_dial_and_bind(config, at_client).await {
+    if try_dial_and_bind(config, at_client, data_mode).await {
         info!("[FAST-RECOVERY] Recovery succeeded.");
     } else {
         warn!("[FAST-RECOVERY] Recovery failed this round; will retry on next monitor cycle.");
@@ -410,7 +473,11 @@ async fn trigger_disaster_recovery(config: &Config, at_client: &ATClient) {
 
 /// 执行拨号并绑定数据通道，返回 true 表示成功
 /// 注意：调用此函数前已确认 SETAUTODIAL != 0
-async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
+async fn try_dial_and_bind(
+    config: &Config,
+    at_client: &ATClient,
+    data_mode: DataMode,
+) -> bool {
     // 断开旧 NDIS 连接
     // 手册：NDISDUP 是异步AT，断开后需等待 ^NDISSTAT: 0，此处用 sleep 兜底
     let _ = at_client.send_command("AT^NDISDUP=1,0".to_string()).await;
@@ -429,7 +496,16 @@ async fn try_dial_and_bind(config: &Config, at_client: &ATClient) -> bool {
     // 手册：NDISDUP 是异步AT，sleep 5s 等待 ^NDISSTAT: 1 及 DHCP 就绪
     let _ = at_client.send_command("AT^NDISDUP=1,1".to_string()).await;
     sleep(Duration::from_secs(5)).await;
-    let actual_ifname = detect_modem_ifname(&config.advanced_network_config.ifname).await;
+    let actual_ifname = match detect_data_ifname(
+        &config.advanced_network_config.ifname,
+        data_mode,
+    ).await {
+        Ok(ifname) => ifname,
+        Err(e) => {
+            error!("[dial] Failed to select data interface: {}", e);
+            return false;
+        }
+    };
     let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "down"]).status().await;
     sleep(Duration::from_secs(1)).await;
     let _ = Command::new("ip").args(&["link", "set", "dev", &actual_ifname, "up"]).status().await;
@@ -469,18 +545,25 @@ async fn wait_for_ip(at_client: &ATClient) -> bool {
     }
 }
 
-async fn detect_modem_ifname(configured: &str) -> String {
+async fn detect_data_ifname(configured: &str, data_mode: DataMode) -> Result<String> {
     if !configured.is_empty() && configured != "auto" {
-        return configured.to_string();
+        let path = format!("/sys/class/net/{}", configured);
+        if fs::metadata(&path).await.is_err() {
+            bail!("configured interface {} does not exist", configured);
+        }
+        return Ok(configured.to_string());
     }
-    if let Some(iface) = detect_modem_interface().await {
-        return iface;
+
+    match data_mode {
+        DataMode::Usb => detect_usb_modem_interface().await.ok_or_else(|| {
+            anyhow!("no USB virtual network interface with vendor ID 3466 was found")
+        }),
+        DataMode::Ethernet => detect_native_ethernet_interface().await,
     }
-    "usb0".to_string()
 }
 
-/// 基于 QModem 原理的绝对精准探测法：直接读取 USB 设备的 Vendor ID (厂商代码)
-async fn detect_modem_interface() -> Option<String> {
+/// USB data mode: find the virtual ECM/NCM interface below the modem USB device.
+async fn detect_usb_modem_interface() -> Option<String> {
     let net_dir = "/sys/class/net";
     let Ok(mut entries) = fs::read_dir(net_dir).await else { return None; };
 
@@ -508,11 +591,190 @@ async fn detect_modem_interface() -> Option<String> {
 
         let vid = vid.trim().to_lowercase();
         if !vid.is_empty() && valid_vids.contains(&vid.as_str()) {
-            info!("Hardware probing success! Found 5G modem: {} (Vendor ID: {})", iface, vid);
+            info!("Found USB modem data interface: {} (Vendor ID: {})", iface, vid);
             return Some(iface);
         }
     }
 
-    warn!("No valid 5G/4G USB modem interface found based on Vendor ID.");
+    warn!("No USB modem data interface found based on Vendor ID.");
     None
-} 
+}
+
+/// Ethernet port mode has no sysfs relationship with the modem USB
+/// device. Select only a native, unbridged 2.5G physical port with carrier.
+/// Ambiguous results are rejected so an arbitrary LAN/WAN port is never rebound.
+async fn detect_native_ethernet_interface() -> Result<String> {
+    let net_dir = "/sys/class/net";
+    let mut entries = fs::read_dir(net_dir).await?;
+    let mut candidates = Vec::new();
+
+    while let Some(entry) = entries.next_entry().await? {
+        let iface = entry.file_name().into_string().unwrap_or_default();
+        if should_skip_interface(&iface) {
+            continue;
+        }
+
+        let base = format!("{}/{}", net_dir, iface);
+        if fs::metadata(format!("{}/device", base)).await.is_err()
+            || fs::metadata(format!("{}/master", base)).await.is_ok()
+        {
+            continue;
+        }
+
+        let device_path = match fs::canonicalize(format!("{}/device", base)).await {
+            Ok(path) => path.to_string_lossy().to_lowercase(),
+            Err(_) => continue,
+        };
+        if device_path.contains("/usb") {
+            continue;
+        }
+
+        let carrier = fs::read_to_string(format!("{}/carrier", base))
+            .await
+            .unwrap_or_default();
+        if carrier.trim() != "1" {
+            continue;
+        }
+
+        let speed = fs::read_to_string(format!("{}/speed", base))
+            .await
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        if speed != Some(2500) {
+            continue;
+        }
+
+        debug!(
+            "Native Ethernet candidate: {} (speed=2500, path={})",
+            iface,
+            device_path
+        );
+        candidates.push(iface);
+    }
+
+    select_single_ethernet_candidate(candidates)
+}
+
+fn should_skip_interface(iface: &str) -> bool {
+    iface == "lo"
+        || iface.starts_with("br-")
+        || iface.starts_with("wl")
+        || iface.starts_with("ra")
+        || iface.starts_with("usb")
+        || iface.starts_with("wwan")
+        || iface.starts_with("ppp")
+        || iface.starts_with("tun")
+        || iface.starts_with("tap")
+        || iface.starts_with("veth")
+        || iface.starts_with("docker")
+}
+
+fn select_single_ethernet_candidate(mut candidates: Vec<String>) -> Result<String> {
+    candidates.sort();
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => bail!(
+            "no active native 2.5G Ethernet port was found; configure option ifname explicitly"
+        ),
+        _ => bail!(
+            "multiple active native 2.5G Ethernet ports were found ({}); configure option ifname explicitly",
+            candidates.join(", ")
+        ),
+    }
+}
+
+async fn detect_data_mode(at_client: &ATClient) -> Result<DataMode> {
+    let response = at_client
+        .send_command("AT^SETAUTODIAL?".to_string())
+        .await?;
+    if !response.success {
+        bail!(
+            "AT^SETAUTODIAL? failed: {}",
+            response.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+
+    let data = response
+        .data
+        .ok_or_else(|| anyhow!("AT^SETAUTODIAL? returned no data"))?;
+    parse_data_mode(&data).ok_or_else(|| {
+        anyhow!(
+            "unsupported or malformed AT^SETAUTODIAL? response: {}",
+            data.replace(['\r', '\n'], " ")
+        )
+    })
+}
+
+fn find_auto_dial_payload(data: &str) -> Option<&str> {
+    data.lines().find_map(|line| {
+        let line = line.trim();
+        Some(line
+            .strip_prefix("^SETAUTODIAL:")
+            .or_else(|| line.strip_prefix("^SETAUTODAIL:"))?
+            .trim())
+    })
+}
+
+fn parse_auto_dial_enabled(data: &str) -> Option<u8> {
+    find_auto_dial_payload(data)?
+        .split(',')
+        .next()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+}
+
+fn parse_auto_dial_fields(data: &str) -> Option<(u8, u8)> {
+    let mut fields = find_auto_dial_payload(data)?.split(',').map(str::trim);
+    let enabled = fields.next()?.parse::<u8>().ok()?;
+    let mode = fields.next()?.parse::<u8>().ok()?;
+    Some((enabled, mode))
+}
+
+fn parse_data_mode(data: &str) -> Option<DataMode> {
+    match parse_auto_dial_fields(data)?.1 {
+        1 => Some(DataMode::Usb),
+        2 => Some(DataMode::Ethernet),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_usb_data_mode() {
+        assert_eq!(
+            parse_data_mode("^SETAUTODIAL: 1,1,\"IPV4V6\"\r\nOK"),
+            Some(DataMode::Usb)
+        );
+    }
+
+    #[test]
+    fn parses_ethernet_data_mode_and_firmware_typo() {
+        assert_eq!(
+            parse_data_mode("^SETAUTODAIL:0,2\r\nOK"),
+            Some(DataMode::Ethernet)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_data_mode() {
+        assert_eq!(parse_data_mode("^SETAUTODIAL: 1,9\r\nOK"), None);
+    }
+
+    #[test]
+    fn parses_disabled_single_field_response() {
+        assert_eq!(parse_auto_dial_enabled("^SETAUTODAIL: 0\r\nOK"), Some(0));
+    }
+
+    #[test]
+    fn rejects_ambiguous_native_ethernet_candidates() {
+        let result = select_single_ethernet_candidate(vec![
+            "eth2".to_string(),
+            "eth3".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+}

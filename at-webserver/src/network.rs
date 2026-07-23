@@ -1,7 +1,8 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{error, info, debug};
 use tokio::process::Command;
+use tokio::time::{sleep, Duration, Instant};
 
 
 // 【新增】启动时清理环境，确保无残留配置
@@ -85,9 +86,11 @@ pub async fn setup_ipv4_only(config: &Config, ifname: &str) -> Result<()> {
     "#;
     let _ = run_command("sh", &["-c", fw_script]).await;
     
-    // 3. 拉起接口
+    // 3. 拉起接口并等待 DHCP 真正完成。ifup 成功只表示请求已提交，
+    // 不能据此宣告数据链路已经可用。
     debug!("Bringing up IPv4 interface...");
-    let _ = run_command("ifup", &["wan_modem"]).await;
+    run_command("ifup", &["wan_modem"]).await?;
+    wait_for_ipv4_interface("wan_modem", Duration::from_secs(60)).await?;
     
     // 4. 重载防火墙
     if run_command("fw4", &["reload"]).await.is_err() {
@@ -217,7 +220,7 @@ EOF
 
     // 4. 拉起接口并重启 odhcpd
     debug!("Bringing up IPv6 interface and restarting odhcpd...");
-    let _ = run_command("ifup", &["wan_modem6"]).await;
+    run_command("ifup", &["wan_modem6"]).await?;
     // 重启 odhcpd 使 relay 配置生效
     let _ = run_command("/etc/init.d/odhcpd", &["restart"]).await;
 
@@ -249,6 +252,61 @@ async fn run_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_ipv4_interface(interface: &str, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+
+    while started.elapsed() < timeout {
+        if let Ok(output) = Command::new("ifstatus").arg(interface).output().await {
+            if output.status.success() {
+                if let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if ipv4_interface_ready(&status) {
+                        info!(
+                            "Interface {} is ready (IPv4 address and default route acquired).",
+                            interface
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+
+    Err(anyhow!(
+        "interface {} did not acquire an IPv4 address and default route within {} seconds",
+        interface,
+        timeout.as_secs()
+    ))
+}
+
+fn ipv4_interface_ready(status: &serde_json::Value) -> bool {
+    let up = status
+        .get("up")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let has_ipv4 = status
+        .get("ipv4-address")
+        .and_then(|value| value.as_array())
+        .map(|addresses| !addresses.is_empty())
+        .unwrap_or(false);
+    let has_default_route = status
+        .get("route")
+        .and_then(|value| value.as_array())
+        .map(|routes| {
+            routes.iter().any(|route| {
+                route
+                    .get("target")
+                    .and_then(|value| value.as_str())
+                    .map(|target| target == "0.0.0.0")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    up && has_ipv4 && has_default_route
+}
+
 pub async fn teardown_modem_network() -> Result<()> {
     info!("Tearing down modem network by frontend request...");
     // 1. 断开网口
@@ -274,3 +332,24 @@ pub async fn teardown_modem_network() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_requires_up_address_and_default_route() {
+        let ready = serde_json::json!({
+            "up": true,
+            "ipv4-address": [{ "address": "192.0.2.2", "mask": 24 }],
+            "route": [{ "target": "0.0.0.0", "mask": 0 }]
+        });
+        assert!(ipv4_interface_ready(&ready));
+
+        let no_route = serde_json::json!({
+            "up": true,
+            "ipv4-address": [{ "address": "192.0.2.2", "mask": 24 }],
+            "route": []
+        });
+        assert!(!ipv4_interface_ready(&no_route));
+    }
+}

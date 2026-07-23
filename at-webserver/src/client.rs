@@ -286,7 +286,11 @@ impl ATClientActor {
                         
                         // 校验这行数据是不是针对我们当前命令的回应
                         let mut is_my_response = false;
-                        if !expected_prefix.is_empty() && line.starts_with(expected_prefix) {
+                        let is_expected_alias = expected_prefix == "^SETAUTODIAL"
+                            && line.starts_with("^SETAUTODAIL");
+                        if !expected_prefix.is_empty()
+                            && (line.starts_with(expected_prefix) || is_expected_alias)
+                        {
                             is_my_response = true;
                         }
 
@@ -315,7 +319,12 @@ impl ATClientActor {
                              
                              // 【终极绝杀补丁】：Vue 前端严格模式兼容 (Prefix Forging)
                              // 如果 Vue 期望一个前缀，但模块返回的是纯数据（如 CGSN 的 IMEI）或纯 OK，我们强行伪造前缀骗过 Vue 的校验
-                             if !expected_prefix.is_empty() && !response_data.contains(expected_prefix) {
+                              let has_expected_alias = expected_prefix == "^SETAUTODIAL"
+                                  && response_data.contains("^SETAUTODAIL");
+                              if !expected_prefix.is_empty()
+                                  && !response_data.contains(expected_prefix)
+                                  && !has_expected_alias
+                              {
                                  let data_only = response_data.replace("OK", "").trim().to_string();
                                  if data_only.is_empty() {
                                      // 纯 OK 响应（如 AT+CMGF=0），追加伪造的前缀

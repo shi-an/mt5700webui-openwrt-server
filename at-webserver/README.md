@@ -42,7 +42,7 @@ config at-webserver 'config'
     
     # 高级网络配置
     option pdp_type 'ipv4v6'             # ipv4, ipv6, ipv4v6
-    option ifname 'auto'                 # auto 或具体接口名 (如 eth1)
+    option ifname 'auto'                 # auto 或具体接口名 (如 eth2)
     option ra_master '0'
     
     # 定时锁频配置
@@ -60,6 +60,13 @@ config at-webserver 'config'
     option tg_chat_id '123456'
     option bark_url 'https://api.day.app/KEY/'
 ```
+
+后端会先查询 `AT^SETAUTODIAL?` 的拨号模式，再选择数据网卡：
+
+- 模式 `1`：USB 虚拟网卡，按模组 USB Vendor ID 探测 ECM/NCM 接口。
+- 模式 `2`：转网口模式，使用软路由原生 2.5G 物理网口；自动检测结果不唯一时必须配置 `ifname`。
+
+`AT+CGPADDR` 只表示模组侧 PDP 已取得地址。后端还会等待 OpenWrt 接口取得 IPv4 地址和默认路由，成功后才将数据链路标记为可用。
 
 ## 📦 依赖包
 

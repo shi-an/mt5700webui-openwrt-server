@@ -179,7 +179,13 @@ return view.extend({
 
 
 		// --- 高级网络 ---
-		
+
+		o = s.taboption('network', form.Value, 'ifname', _('数据网卡'),
+			_('留空或填写 auto 时自动检测：USB 模式匹配模组 USB 网卡，转网口模式匹配唯一一个已连接的原生 2.5G 网口。存在多个候选网口时必须明确填写，例如 eth2。'));
+		o.default = 'auto';
+		o.placeholder = 'eth2';
+		o.rmempty = false;
+
 		o = s.taboption('network', form.DynamicList, 'dns_list', _('自定义 DNS'), _('留空则自动使用运营商下发的 DNS。填写后将强制使用此处指定的 DNS 服务器。'));
 		o.datatype = 'ipaddr';
 		o.optional = true;
