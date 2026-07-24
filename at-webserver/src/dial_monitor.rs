@@ -12,6 +12,7 @@ use tokio::fs;
 
 const DATA_CID: u8 = 1;
 const SESSION_QUERY_FAILURE_LIMIT: u8 = 3;
+const SESSION_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// IP 连接状态，参考 QModem modem_dial.sh 的 connection_status 四状态设计
 #[derive(Debug, Clone, PartialEq)]
@@ -155,9 +156,9 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
             }
         };
 
-        match detect_data_mode(&at_client).await {
-            Ok(detected) => {
-                if data_mode != Some(detected) {
+        let auto_dial_disabled = match query_auto_dial_state(&at_client).await {
+            Ok((detected, disabled)) => {
+                if let Some(detected) = detected.filter(|detected| data_mode != Some(*detected)) {
                     let previous_mode = data_mode;
                     if let Some(previous) = previous_mode {
                         warn!(
@@ -177,22 +178,25 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     unexpected_response_count = 0;
                     session_query_method = SessionQueryMethod::Discover(0);
                     last_session_recovery = None;
-                    initialized_connection_generation = 0;
                     if previous_mode.is_some() {
                         session_event = None;
                         drain_modem_session_events(&mut session_rx);
                     }
                 }
+                disabled
             }
             Err(e) => {
                 warn!("Unable to determine modem data mode: {}", e);
+                false
             }
-        }
+        };
 
         let connection_generation = at_client.connection_generation();
         if connection_generation > 0
             && initialized_connection_generation != connection_generation
         {
+            session_query_method = SessionQueryMethod::Discover(0);
+            last_session_recovery = None;
             match initialize_modem_services(&config, &at_client).await {
                 Ok(()) => initialized_connection_generation = connection_generation,
                 Err(e) => warn!(
@@ -208,7 +212,11 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
         };
 
         if let Some(event) = session_event {
-            if !is_data_session_cid(event.cid) {
+            if active_mode == DataMode::Ethernet {
+                debug!(
+                    "Ignoring ^NDISSTAT event in Ethernet mode; using CGPADDR and the native WAN state."
+                );
+            } else if !is_data_session_cid(event.cid) {
                 debug!(
                     "Ignoring modem session event for unrelated cid {:?}; data cid is {}.",
                     event.cid,
@@ -233,8 +241,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                         continue;
                     }
                     ModemSessionState::Disconnected => {
-                        initialized_connection_generation = 0;
-                        if is_auto_dial_disabled(&at_client).await {
+                        if auto_dial_disabled {
                             debug!("[monitor] Modem session disconnected while auto dial is disabled.");
                             state = ConnectionState::Disconnected;
                             active_interface = None;
@@ -242,23 +249,18 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                             continue;
                         }
 
-                        if last_session_recovery
-                            .map(|last| last.elapsed() < Duration::from_secs(15))
-                            .unwrap_or(false)
-                        {
-                            debug!("Ignoring a delayed disconnect event from the recent recovery; polling current state.");
+                        if session_recovery_cooling_down(last_session_recovery) {
+                            debug!("Ignoring a disconnect event during the modem-session recovery cooldown.");
                         } else {
                             warn!(
                                 "[NDISSTAT] Modem session disconnected in {} mode; reconnecting session.",
                                 active_mode.label()
                             );
-                            let recovered = recover_modem_session(&at_client, active_mode, false).await;
-                            initialized_connection_generation = 0;
-                            session_query_method = SessionQueryMethod::Discover(0);
+                            let requested = request_modem_session_recovery(&at_client, active_mode, false).await;
                             last_session_recovery = Some(Instant::now());
                             drain_modem_session_events(&mut session_rx);
-                            if !recovered {
-                                warn!("Modem session reconnect failed; retrying on a later poll.");
+                            if !requested {
+                                warn!("Modem session reconnect request failed; retrying after cooldown.");
                             }
                             state = ConnectionState::Disconnected;
                             active_interface = None;
@@ -290,7 +292,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 state = ConnectionState::Disconnected;
                 active_interface = None;
 
-                if is_auto_dial_disabled(&at_client).await {
+                if auto_dial_disabled {
                     debug!("Modem session is down while auto dial is disabled.");
                     session_fail_count = 0;
                     continue;
@@ -303,13 +305,15 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     session_fail_count
                 );
                 if session_fail_count >= 3 {
-                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
-                    initialized_connection_generation = 0;
-                    session_query_method = SessionQueryMethod::Discover(0);
-                    last_session_recovery = Some(Instant::now());
-                    drain_modem_session_events(&mut session_rx);
-                    if !recovered {
-                        warn!("Forced modem session recovery failed.");
+                    if session_recovery_cooling_down(last_session_recovery) {
+                        debug!("Modem session reconnect is cooling down; deferring another request.");
+                    } else {
+                        let requested = request_modem_session_recovery(&at_client, active_mode, false).await;
+                        last_session_recovery = Some(Instant::now());
+                        drain_modem_session_events(&mut session_rx);
+                        if !requested {
+                            warn!("Modem session reconnect request failed.");
+                        }
                     }
                     session_fail_count = 0;
                 }
@@ -318,7 +322,7 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                 unexpected_response_count = 0;
                 state = ConnectionState::Disconnected;
                 active_interface = None;
-                if is_auto_dial_disabled(&at_client).await {
+                if auto_dial_disabled {
                     debug!("Modem session has no address while auto dial is disabled.");
                     session_fail_count = 0;
                     continue;
@@ -329,13 +333,15 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     session_fail_count
                 );
                 if session_fail_count >= 3 {
-                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
-                    initialized_connection_generation = 0;
-                    session_query_method = SessionQueryMethod::Discover(0);
-                    last_session_recovery = Some(Instant::now());
-                    drain_modem_session_events(&mut session_rx);
-                    if !recovered {
-                        warn!("Recovery of the address-less modem session failed.");
+                    if session_recovery_cooling_down(last_session_recovery) {
+                        debug!("Forced modem session recovery is cooling down.");
+                    } else {
+                        let requested = request_modem_session_recovery(&at_client, active_mode, true).await;
+                        last_session_recovery = Some(Instant::now());
+                        drain_modem_session_events(&mut session_rx);
+                        if !requested {
+                            warn!("Recovery request for the address-less modem session failed.");
+                        }
                     }
                     session_fail_count = 0;
                 }
@@ -347,18 +353,20 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     unexpected_response_count
                 );
                 if unexpected_response_count >= 3 {
-                    if is_auto_dial_disabled(&at_client).await {
+                    if auto_dial_disabled {
                         debug!("Skipping probe-failure recovery because auto dial is disabled.");
                         unexpected_response_count = 0;
                         continue;
                     }
-                    let recovered = recover_modem_session(&at_client, active_mode, true).await;
-                    initialized_connection_generation = 0;
-                    session_query_method = SessionQueryMethod::Discover(0);
-                    last_session_recovery = Some(Instant::now());
-                    drain_modem_session_events(&mut session_rx);
-                    if !recovered {
-                        warn!("Modem session recovery after probe failures did not succeed.");
+                    if session_recovery_cooling_down(last_session_recovery) {
+                        debug!("Modem session recovery after probe failures is cooling down.");
+                    } else {
+                        let requested = request_modem_session_recovery(&at_client, active_mode, true).await;
+                        last_session_recovery = Some(Instant::now());
+                        drain_modem_session_events(&mut session_rx);
+                        if !requested {
+                            warn!("Modem session recovery request after probe failures failed.");
+                        }
                     }
                     unexpected_response_count = 0;
                     state = ConnectionState::Disconnected;
@@ -458,18 +466,24 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                                         router_fail_count
                                     );
                                     if router_fail_count >= 3 {
-                                        if is_auto_dial_disabled(&at_client).await {
+                                        if auto_dial_disabled {
                                             debug!("Skipping USB session recovery because auto dial is disabled.");
                                             router_fail_count = 0;
                                             continue;
                                         }
-                                        let recovered = recover_modem_session(&at_client, active_mode, true).await;
-                                        initialized_connection_generation = 0;
-                                        session_query_method = SessionQueryMethod::Discover(0);
-                                        last_session_recovery = Some(Instant::now());
-                                        drain_modem_session_events(&mut session_rx);
-                                        if !recovered {
-                                            warn!("USB data-session recovery failed.");
+                                        if session_recovery_cooling_down(last_session_recovery) {
+                                            debug!("USB data-session recovery is cooling down.");
+                                        } else {
+                                            let requested = request_modem_session_recovery(
+                                                &at_client,
+                                                active_mode,
+                                                true,
+                                            ).await;
+                                            last_session_recovery = Some(Instant::now());
+                                            drain_modem_session_events(&mut session_rx);
+                                            if !requested {
+                                                warn!("USB data-session recovery request failed.");
+                                            }
                                         }
                                         state = ConnectionState::Disconnected;
                                         active_interface = None;
@@ -679,7 +693,11 @@ async fn check_data_session(
     query_method: &mut SessionQueryMethod,
     data_mode: DataMode,
 ) -> Result<DataSessionStatus> {
-    let queried_state = query_modem_session_state(at_client, query_method).await;
+    let queried_state = if data_mode == DataMode::Usb {
+        query_modem_session_state(at_client, query_method).await
+    } else {
+        None
+    };
     if let Some(status) = authoritative_session_status(data_mode, queried_state) {
         return Ok(status);
     }
@@ -951,24 +969,15 @@ fn is_data_session_cid(cid: Option<u8>) -> bool {
     cid.map(|value| value == DATA_CID).unwrap_or(true)
 }
 
-/// 检查模组是否已被用户手动关闭自动拨号（AT^SETAUTODIAL=0）
-/// 返回 true 表示已关闭，后端不应触发灾难恢复
-async fn is_auto_dial_disabled(at_client: &ATClient) -> bool {
-    let resp = at_client.send_command("AT^SETAUTODIAL?".to_string()).await;
-    if let Ok(r) = resp {
-        if let Some(data) = r.data {
-            // Some firmware spells the prefix as SETAUTODAIL.
-            return parse_auto_dial_enabled(&data)
-                .map(|enabled| enabled == 0)
-                .unwrap_or(false);
-        }
-    }
-    false // 查询失败时保守处理，不阻止恢复
+fn session_recovery_cooling_down(last_recovery: Option<Instant>) -> bool {
+    last_recovery
+        .map(|last| last.elapsed() < SESSION_RECOVERY_COOLDOWN)
+        .unwrap_or(false)
 }
 
-/// Recover only the modem-side data session. Router interface recovery is kept
-/// separate so DHCP/default-route failures never cause an unnecessary redial.
-async fn recover_modem_session(
+/// Request modem-side recovery and return once the asynchronous NDIS command
+/// is accepted. Later monitor polls confirm whether an address was obtained.
+async fn request_modem_session_recovery(
     at_client: &ATClient,
     data_mode: DataMode,
     force_reset: bool,
@@ -993,26 +1002,24 @@ async fn recover_modem_session(
 
     let connect_command = format!("AT^NDISDUP={},1", DATA_CID);
     match at_client.send_command(connect_command).await {
-        Ok(response) if response.success => {}
+        Ok(response) if response.success => {
+            info!(
+                "Modem data-session reconnect requested for {}; status will be checked on a later poll.",
+                data_mode.label()
+            );
+            true
+        }
         Ok(response) => {
             warn!(
                 "Session connect command failed: {}",
                 response.error.unwrap_or_else(|| "unknown error".to_string())
             );
-            return false;
+            false
         }
         Err(e) => {
             warn!("Failed to send session connect command: {}", e);
-            return false;
+            false
         }
-    }
-
-    if wait_for_ip(at_client).await {
-        info!("Modem data session recovered for {} mode.", data_mode.label());
-        true
-    } else {
-        warn!("Timed out waiting for modem data-session address.");
-        return false;
     }
 }
 
@@ -1030,38 +1037,6 @@ fn drain_modem_session_events(
     }
     if drained > 0 {
         debug!("Drained {} session event(s) generated during recovery.", drained);
-    }
-}
-
-/// 等待有效 IP，参考 QModem 增加 120 秒超时熔断
-/// 返回 true 表示成功获取 IP，false 表示超时
-async fn wait_for_ip(at_client: &ATClient) -> bool {
-    debug!("Waiting for valid IP address (timeout: 120s)...");
-    let max_retries = 60u32; // 60 * 2s = 120s
-    let mut retries = 0u32;
-
-    loop {
-        if retries >= max_retries {
-            error!("Timed out (120s) waiting for valid IP address.");
-            return false;
-        }
-        match check_ip_status(at_client).await {
-            Ok(status) if status.has_ip() => {
-                debug!("IP successfully obtained.");
-                return true;
-            }
-            Ok(IpStatus::Unexpected) => {
-                warn!("Unexpected AT response while waiting for IP (retry {}/{}).", retries + 1, max_retries);
-            }
-            Ok(_) => {
-                debug!("No IP yet, retrying ({}/{})...", retries + 1, max_retries);
-            }
-            Err(e) => {
-                warn!("Error checking IP status: {}", e);
-            }
-        }
-        retries += 1;
-        sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -1263,7 +1238,7 @@ fn select_single_ethernet_candidate(mut candidates: Vec<String>) -> Result<Strin
     }
 }
 
-async fn detect_data_mode(at_client: &ATClient) -> Result<DataMode> {
+async fn query_auto_dial_state(at_client: &ATClient) -> Result<(Option<DataMode>, bool)> {
     let response = at_client
         .send_command("AT^SETAUTODIAL?".to_string())
         .await?;
@@ -1277,12 +1252,21 @@ async fn detect_data_mode(at_client: &ATClient) -> Result<DataMode> {
     let data = response
         .data
         .ok_or_else(|| anyhow!("AT^SETAUTODIAL? returned no data"))?;
-    parse_data_mode(&data).ok_or_else(|| {
+    let enabled = parse_auto_dial_enabled(&data).ok_or_else(|| {
         anyhow!(
-            "unsupported or malformed AT^SETAUTODIAL? response: {}",
+            "malformed AT^SETAUTODIAL? response: {}",
             data.replace(['\r', '\n'], " ")
         )
-    })
+    })?;
+    let disabled = enabled == 0;
+    let data_mode = parse_data_mode(&data);
+    if !disabled && data_mode.is_none() {
+        bail!(
+            "unsupported AT^SETAUTODIAL? mode: {}",
+            data.replace(['\r', '\n'], " ")
+        );
+    }
+    Ok((data_mode, disabled))
 }
 
 fn find_auto_dial_payload(data: &str) -> Option<&str> {
@@ -1389,6 +1373,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_disconnected_dual_stack_query_without_cid() {
+        assert_eq!(
+            parse_ndis_query_state(
+                "^NDISSTATQRY: 0,0,,\"IPV4\",0,0,,\"IPV6\"\r\nOK",
+                DATA_CID,
+            ),
+            Some(ModemSessionState::Disconnected)
+        );
+    }
+
+    #[test]
     fn parses_cid_prefixed_ndis_query_state() {
         assert_eq!(
             parse_ndis_query_state(
@@ -1453,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn usb_mode_treats_session_query_disconnect_as_authoritative() {
+    fn usb_ndis_disconnect_and_connecting_states_are_authoritative() {
         assert_eq!(
             authoritative_session_status(
                 DataMode::Usb,
@@ -1461,6 +1456,24 @@ mod tests {
             ),
             Some(DataSessionStatus::Disconnected)
         );
+        assert_eq!(
+            authoritative_session_status(
+                DataMode::Usb,
+                Some(ModemSessionState::Connecting),
+            ),
+            Some(DataSessionStatus::Connecting)
+        );
+        assert_eq!(
+            authoritative_session_status(
+                DataMode::Usb,
+                Some(ModemSessionState::Connected),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ethernet_mode_ignores_ndis_query_state() {
         assert_eq!(
             authoritative_session_status(
                 DataMode::Ethernet,
@@ -1471,13 +1484,10 @@ mod tests {
     }
 
     #[test]
-    fn ethernet_mode_accepts_data_cid_address_over_stale_query_state() {
+    fn data_cid_address_is_accepted_when_session_query_is_unavailable() {
         let ip_status = IpStatus::Ipv4Only("100.64.1.2".to_string());
         assert_eq!(
-            resolve_ip_session_status(
-                Some(ModemSessionState::Disconnected),
-                ip_status.clone(),
-            ),
+            resolve_ip_session_status(None, ip_status.clone()),
             DataSessionStatus::Connected(ip_status)
         );
     }
