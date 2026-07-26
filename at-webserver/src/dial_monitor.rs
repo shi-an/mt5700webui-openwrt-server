@@ -42,7 +42,7 @@ enum ConnectionState {
 
 #[derive(Debug, PartialEq)]
 enum DataSessionStatus {
-    Connected(IpStatus),
+    Ready(Option<IpStatus>),
     Connecting,
     NoAddress,
     Disconnected,
@@ -373,14 +373,20 @@ pub async fn start_monitor(config: Config, at_client: ATClient) {
                     active_interface = None;
                 }
             }
-            Ok(DataSessionStatus::Connected(ref ip_status)) => {
+            Ok(DataSessionStatus::Ready(ref ip_status)) => {
                 session_fail_count = 0;
                 unexpected_response_count = 0;
-                log_ip_status(ip_status);
+                if let Some(ip_status) = ip_status {
+                    log_ip_status(ip_status);
+                }
 
                 match state {
                     ConnectionState::Disconnected => {
-                        info!("Modem session has an IP address. Preparing router data path...");
+                        if active_mode == DataMode::Ethernet {
+                            info!("Ethernet data mode is active. Preparing the native router data path...");
+                        } else {
+                            info!("Modem session has a PDP address. Preparing router data path...");
+                        }
                         let selection = match detect_data_interface(
                             &config.advanced_network_config.ifname,
                             active_mode,
@@ -688,16 +694,23 @@ async fn device_carrier_down(device: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn mode_managed_data_session_status(data_mode: DataMode) -> Option<DataSessionStatus> {
+    match data_mode {
+        DataMode::Ethernet => Some(DataSessionStatus::Ready(None)),
+        DataMode::Usb => None,
+    }
+}
+
 async fn check_data_session(
     at_client: &ATClient,
     query_method: &mut SessionQueryMethod,
     data_mode: DataMode,
 ) -> Result<DataSessionStatus> {
-    let queried_state = if data_mode == DataMode::Usb {
-        query_modem_session_state(at_client, query_method).await
-    } else {
-        None
-    };
+    if let Some(status) = mode_managed_data_session_status(data_mode) {
+        return Ok(status);
+    }
+
+    let queried_state = query_modem_session_state(at_client, query_method).await;
     if let Some(status) = authoritative_session_status(data_mode, queried_state) {
         return Ok(status);
     }
@@ -728,7 +741,7 @@ fn resolve_ip_session_status(
     ip_status: IpStatus,
 ) -> DataSessionStatus {
     match ip_status {
-        status if status.has_ip() => DataSessionStatus::Connected(status),
+        status if status.has_ip() => DataSessionStatus::Ready(Some(status)),
         IpStatus::NoIp if queried_state == Some(ModemSessionState::Disconnected) => {
             DataSessionStatus::Disconnected
         }
@@ -982,6 +995,11 @@ async fn request_modem_session_recovery(
     data_mode: DataMode,
     force_reset: bool,
 ) -> bool {
+    if data_mode != DataMode::Usb {
+        warn!("Skipping NDIS recovery outside USB virtual network interface mode.");
+        return false;
+    }
+
     warn!(
         "Recovering modem data session for {} mode (force_reset={}).",
         data_mode.label(),
@@ -1484,11 +1502,20 @@ mod tests {
     }
 
     #[test]
+    fn ethernet_mode_enters_router_checks_without_an_at_reported_ip() {
+        assert_eq!(
+            mode_managed_data_session_status(DataMode::Ethernet),
+            Some(DataSessionStatus::Ready(None))
+        );
+        assert_eq!(mode_managed_data_session_status(DataMode::Usb), None);
+    }
+
+    #[test]
     fn data_cid_address_is_accepted_when_session_query_is_unavailable() {
         let ip_status = IpStatus::Ipv4Only("100.64.1.2".to_string());
         assert_eq!(
             resolve_ip_session_status(None, ip_status.clone()),
-            DataSessionStatus::Connected(ip_status)
+            DataSessionStatus::Ready(Some(ip_status))
         );
     }
 

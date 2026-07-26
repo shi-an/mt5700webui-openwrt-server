@@ -75,10 +75,10 @@ config at-webserver 'config'
 后端将健康状态分为三层，避免把路由侧 DHCP 故障误判为模组掉线：
 
 1. **工作模式**：定期查询 `AT^SETAUTODIAL?`，区分 USB 虚拟网卡和转网口模式。
-2. **模组数据会话**：只跟踪数据 CID `1`。USB 虚拟网卡模式使用 `^NDISSTAT` / `AT^NDISSTATQRY` 判断 NDIS 状态，并用 `AT+CGPADDR` 确认 PDP 地址；转网口模式忽略 NDIS 状态，直接使用 `AT+CGPADDR` 检查模组 PDP 地址。IMS 等其他 CID 不会触发重拨。
+2. **模组数据会话**：USB 虚拟网卡模式只跟踪数据 CID `1`，使用 `^NDISSTAT` / `AT^NDISSTATQRY` 判断 NDIS 状态，并用 `AT+CGPADDR` 确认 PDP 地址；转网口模式不依赖 AT 上报 IP，直接进入原生 `wan` 的路由侧检查。IMS 等其他 CID 不会触发重拨。
 3. **路由侧链路**：检查对应 OpenWrt 接口的 carrier、IPv4 地址和默认路由。IPv4 或路由连续异常时只重启该逻辑接口；转网口模式的网线 carrier 断开时只等待链路恢复，不重拨模组。
 
-只有 CID `1` 会话确认断开、持续无地址或连续探测异常，以及 USB 数据接口 carrier 连续异常时，后端才通过 `AT^NDISDUP=1,0/1` 重建数据会话。恢复流程不会执行模组重启、`AT+CFUN` 或 OpenWrt 整机重启。
+只有 USB 虚拟网卡模式下 CID `1` 会话确认断开、持续无地址或连续探测异常，以及 USB 数据接口 carrier 连续异常时，后端才通过 `AT^NDISDUP=1,0/1` 重建数据会话。转网口模式只恢复原生 OpenWrt 接口，不执行 NDIS 重拨。恢复流程不会执行模组重启、`AT+CFUN` 或 OpenWrt 整机重启。
 
 ## 📦 依赖包
 
