@@ -1087,10 +1087,9 @@ async fn detect_data_interface(configured: &str, data_mode: DataMode) -> Result<
                 );
                 return Ok(selection);
             }
-
-            detect_native_gigabit_interface()
-                .await
-                .map(DataInterface::managed)
+            bail!(
+                "native OpenWrt interface wan could not be resolved; waiting instead of creating a duplicate wan_modem interface"
+            )
         }
     }
 }
@@ -1098,21 +1097,26 @@ async fn detect_data_interface(configured: &str, data_mode: DataMode) -> Result<
 /// Resolve an existing OpenWrt logical interface to its kernel network device.
 /// Reusing `wan` avoids starting a second DHCP client on the same physical port.
 async fn resolve_logical_interface(interface: &str) -> Option<DataInterface> {
-    let uci_key = format!("network.{}.device", interface);
-    let configured_device = Command::new("uci")
-        .args(["-q", "get", &uci_key])
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            (!value.is_empty()).then_some(value)
-        });
+    // Support both modern `option device` and legacy `option ifname` UCI
+    // layouts. This path does not depend on the interface already being up.
+    for option in ["device", "ifname"] {
+        let uci_key = format!("network.{}.{}", interface, option);
+        let Ok(output) = Command::new("uci")
+            .args(["-q", "get", &uci_key])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
 
-    if let Some(device) = configured_device {
-        if fs::metadata(format!("/sys/class/net/{}", device)).await.is_ok() {
-            return Some(DataInterface::existing(interface, device));
+        let value = String::from_utf8_lossy(&output.stdout);
+        for device in value.split_whitespace() {
+            if fs::metadata(format!("/sys/class/net/{}", device)).await.is_ok() {
+                return Some(DataInterface::existing(interface, device.to_string()));
+            }
         }
     }
 
@@ -1172,88 +1176,6 @@ async fn detect_usb_modem_interface() -> Option<String> {
 
     warn!("No USB modem data interface found based on Vendor ID.");
     None
-}
-
-/// Fallback for systems without a resolvable `network.wan`: select a unique,
-/// linked native gigabit port. Multi-WAN systems must configure the interface.
-async fn detect_native_gigabit_interface() -> Result<String> {
-    let net_dir = "/sys/class/net";
-    let mut entries = fs::read_dir(net_dir).await?;
-    let mut candidates = Vec::new();
-
-    while let Some(entry) = entries.next_entry().await? {
-        let iface = entry.file_name().into_string().unwrap_or_default();
-        if should_skip_interface(&iface) {
-            continue;
-        }
-
-        let base = format!("{}/{}", net_dir, iface);
-        if fs::metadata(format!("{}/device", base)).await.is_err()
-            || fs::metadata(format!("{}/master", base)).await.is_ok()
-        {
-            continue;
-        }
-
-        let device_path = match fs::canonicalize(format!("{}/device", base)).await {
-            Ok(path) => path.to_string_lossy().to_lowercase(),
-            Err(_) => continue,
-        };
-        if device_path.contains("/usb") {
-            continue;
-        }
-
-        let carrier = fs::read_to_string(format!("{}/carrier", base))
-            .await
-            .unwrap_or_default();
-        if carrier.trim() != "1" {
-            continue;
-        }
-
-        let speed = fs::read_to_string(format!("{}/speed", base))
-            .await
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok());
-        if speed != Some(1000) {
-            continue;
-        }
-
-        debug!(
-            "Native gigabit Ethernet candidate: {} (speed=1000, path={})",
-            iface,
-            device_path
-        );
-        candidates.push(iface);
-    }
-
-    select_single_ethernet_candidate(candidates)
-}
-
-fn should_skip_interface(iface: &str) -> bool {
-    iface == "lo"
-        || iface.starts_with("br-")
-        || iface.starts_with("wl")
-        || iface.starts_with("ra")
-        || iface.starts_with("usb")
-        || iface.starts_with("wwan")
-        || iface.starts_with("ppp")
-        || iface.starts_with("tun")
-        || iface.starts_with("tap")
-        || iface.starts_with("veth")
-        || iface.starts_with("docker")
-}
-
-fn select_single_ethernet_candidate(mut candidates: Vec<String>) -> Result<String> {
-    candidates.sort();
-    match candidates.len() {
-        1 => Ok(candidates.remove(0)),
-        0 => bail!(
-            "native OpenWrt interface wan could not be resolved and no active native gigabit port was found; configure option ifname explicitly"
-        ),
-        _ => bail!(
-            "multiple active native gigabit Ethernet ports were found ({}); configure the modem WAN interface explicitly",
-            candidates.join(", ")
-        ),
-    }
 }
 
 async fn query_auto_dial_state(at_client: &ATClient) -> Result<(Option<DataMode>, bool)> {
@@ -1349,15 +1271,6 @@ mod tests {
     #[test]
     fn parses_disabled_single_field_response() {
         assert_eq!(parse_auto_dial_enabled("^SETAUTODAIL: 0\r\nOK"), Some(0));
-    }
-
-    #[test]
-    fn rejects_ambiguous_native_ethernet_candidates() {
-        let result = select_single_ethernet_candidate(vec![
-            "eth2".to_string(),
-            "eth3".to_string(),
-        ]);
-        assert!(result.is_err());
     }
 
     #[test]

@@ -70,7 +70,7 @@ config at-webserver 'config'
 - 模式 `1`：USB 虚拟网卡，按模组 USB Vendor ID 探测 ECM/NCM 接口。
 - 模式 `2`：转网口模式，默认复用 OpenWrt 原生逻辑接口 `wan`，不会在同一物理口上启动第二个 DHCP 客户端。
 
-默认控制连接为 `SERIAL + auto`。后端优先枚举 VID `3466` 下的 `ttyUSB*`/`ttyACM*`，逐个发送 `AT`，仅使用返回完整 `OK` 的控制通道。宽带与模组组成多 WAN 时，应将 `ifname` 设置为模组对应的逻辑接口（如 `wan2`）；填写未配置的物理口（如 `eth2`）时，后端会创建并管理 `wan_modem`。
+默认控制连接为 `SERIAL + auto`。后端优先枚举 VID `3466` 下的 `ttyUSB*`/`ttyACM*`，逐个发送 `AT`，仅使用返回完整 `OK` 的控制通道。转网口模式的 `ifname=auto` 只复用逻辑接口 `wan`；即使 `wan` 暂时未就绪，也不会在其物理设备上创建重复的 `wan_modem`。宽带与模组组成多 WAN 时，应将 `ifname` 设置为模组对应的逻辑接口（如 `wan2`）；只有显式填写未配置的物理口（如 `eth2`）时，后端才会创建并管理 `wan_modem`。
 
 后端将健康状态分为三层，避免把路由侧 DHCP 故障误判为模组掉线：
 
